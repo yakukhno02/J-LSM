@@ -1,1 +1,101 @@
-.idea
+ ==========================================
+# Maven / Build Artifacts
+# ==========================================
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.flattened-pom.xml
+
+# Compiled class files
+*.class
+
+# Package files
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Log files
+*.log
+
+# ==========================================
+# Testing & Code Coverage
+# ==========================================
+# JaCoCo
+*.exec
+*.dump
+
+# Pitest
+pitest-reports/
+.pitest/
+
+# jqwik database
+.jqwik-database/
+.jqwik-database
+
+# ==========================================
+# IDEs & Editors
+# ==========================================
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# VS Code (Visual Studio Code)
+.vscode/
+*.code-workspace
+
+# Eclipse
+.settings/
+.project
+.classpath
+
+# NetBeans
+nbproject/private/
+nbbuild/
+dist/
+nbproject/Makefile-*.mk
+nbproject/Package-*.mk
+
+# ==========================================
+# Operating System Files
+# ==========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ==========================================
+# J-LSM Runtime / Temporary Test Data
+# ==========================================
+*.wal.tmp
+*.sst.tmp
+data/
+test-db/
+tmp/
