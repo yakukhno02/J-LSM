@@ -21,7 +21,7 @@ public final class DefaultWalReader implements WalReader {
     public static final int HEADER_SIZE = DefaultWalWriter.HEADER_SIZE;
     public static final int WAL_MAGIC = DefaultWalWriter.WAL_MAGIC;
     public static final int FORMAT_VERSION = DefaultWalWriter.FORMAT_VERSION;
-    private static final int FRAME_HEADER_LEN = 4 + 8 + 1 + 4 + 4; // CRC(4) + Seq(8) + Type(1) + KeyLen(4) + ValLen(4) = 21
+    private static final int FRAME_HEADER_LEN = 21; // CRC(4) + Seq(8) + Type(1) + KeyLen(4) + ValLen(4)
 
     private final ChannelIO channel;
     private final Path path;
@@ -104,65 +104,25 @@ public final class DefaultWalReader implements WalReader {
 
         try {
             long fileSize = channel.size();
-            ByteBuffer fixedBuf = ByteBuffer.allocate(FRAME_HEADER_LEN).order(ByteOrder.BIG_ENDIAN);
 
             while (currentOffset < fileSize) {
-                long remaining = fileSize - currentOffset;
-                if (remaining < FRAME_HEADER_LEN) {
-                    truncateTail(lastValidOffset);
-                    return lastValidOffset;
-                }
-
-                fixedBuf.clear();
-                readFully(channel, fixedBuf, currentOffset);
-                fixedBuf.flip();
-
-                int storedCrc = fixedBuf.getInt();
-                long seq = fixedBuf.getLong();
-                byte typeByte = fixedBuf.get();
-                int keyLen = fixedBuf.getInt();
-                int valLen = fixedBuf.getInt();
-
-                if (typeByte != 0x01 && typeByte != 0x02) {
+                ParsedFrame frame;
+                try {
+                    frame = readAndValidateFrame(channel, path, currentOffset, fileSize);
+                } catch (CorruptedLogException e) {
                     if (currentOffset + FRAME_HEADER_LEN >= fileSize) {
                         truncateTail(lastValidOffset);
                         return lastValidOffset;
                     }
-                    throw new CorruptedLogException(path, currentOffset + 12L, "Invalid record type: " + typeByte);
+                    throw e;
                 }
 
-                if (keyLen < 0 || valLen < 0 || ((long) keyLen + valLen > DefaultWalWriter.MAX_KEY_VALUE_TOTAL_BYTES)) {
-                    if (currentOffset + FRAME_HEADER_LEN >= fileSize) {
-                        truncateTail(lastValidOffset);
-                        return lastValidOffset;
-                    }
-                    throw new CorruptedLogException(path, currentOffset + 13L, "Invalid keyLen (" + keyLen + ") or valLen (" + valLen + ")");
-                }
-
-                int payloadLen = 8 + 1 + 4 + 4 + keyLen + valLen;
-                int totalFrameLen = 4 + payloadLen;
-
-                if (remaining < totalFrameLen) {
+                if (frame == null) {
                     truncateTail(lastValidOffset);
                     return lastValidOffset;
                 }
 
-                ByteBuffer fullPayloadBuf = ByteBuffer.allocate(payloadLen).order(ByteOrder.BIG_ENDIAN);
-                readFully(channel, fullPayloadBuf, currentOffset + 4);
-
-                CRC32 crc32 = new CRC32();
-                crc32.update(fullPayloadBuf.array(), 0, payloadLen);
-                int calculatedCrc = (int) crc32.getValue();
-
-                if (storedCrc != calculatedCrc) {
-                    if (currentOffset + totalFrameLen == fileSize) {
-                        truncateTail(lastValidOffset);
-                        return lastValidOffset;
-                    }
-                    throw new CorruptedLogException(path, currentOffset, String.format("Mid-file CRC mismatch: stored 0x%08X, calculated 0x%08X", storedCrc, calculatedCrc));
-                }
-
-                currentOffset += totalFrameLen;
+                currentOffset += frame.totalFrameLen();
                 lastValidOffset = currentOffset;
             }
 
@@ -207,6 +167,72 @@ public final class DefaultWalReader implements WalReader {
         }
     }
 
+    private static ParsedFrame readAndValidateFrame(ChannelIO channel, Path path, long offset, long fileSize)
+            throws IOException, StorageException {
+        long remaining = fileSize - offset;
+        if (remaining < FRAME_HEADER_LEN) {
+            return null;
+        }
+
+        ByteBuffer headerBuf = ByteBuffer.allocate(FRAME_HEADER_LEN).order(ByteOrder.BIG_ENDIAN);
+        readFully(channel, headerBuf, offset);
+        headerBuf.flip();
+
+        int storedCrc = headerBuf.getInt();
+        long seq = headerBuf.getLong();
+        byte typeByte = headerBuf.get();
+        int keyLen = headerBuf.getInt();
+        int valLen = headerBuf.getInt();
+
+        RecordKind kind;
+        if (typeByte == 0x01) {
+            kind = RecordKind.PUT;
+        } else if (typeByte == 0x02) {
+            kind = RecordKind.DELETE;
+            valLen = 0;
+        } else {
+            throw new CorruptedLogException(path, offset + 12L, "Unknown record type: " + typeByte);
+        }
+
+        if (keyLen < 0 || valLen < 0 || ((long) keyLen + valLen > DefaultWalWriter.MAX_KEY_VALUE_TOTAL_BYTES)) {
+            throw new CorruptedLogException(path, offset + 13L, "Invalid keyLen (" + keyLen + ") or valLen (" + valLen + ")");
+        }
+
+        int payloadLen = 8 + 1 + 4 + 4 + keyLen + valLen;
+        int totalFrameLen = 4 + payloadLen;
+
+        if (remaining < totalFrameLen) {
+            return null;
+        }
+
+        ByteBuffer payloadBuf = ByteBuffer.allocate(payloadLen).order(ByteOrder.BIG_ENDIAN);
+        readFully(channel, payloadBuf, offset + 4);
+
+        CRC32 crc32 = new CRC32();
+        crc32.update(payloadBuf.array(), 0, payloadLen);
+        int calculatedCrc = (int) crc32.getValue();
+
+        if (storedCrc != calculatedCrc) {
+            throw new CorruptedLogException(path, offset,
+                    String.format("Frame CRC mismatch: stored 0x%08X, calculated 0x%08X", storedCrc, calculatedCrc));
+        }
+
+        payloadBuf.position(8 + 1 + 4 + 4);
+        byte[] key = new byte[keyLen];
+        payloadBuf.get(key);
+
+        byte[] val = null;
+        if (kind == RecordKind.PUT && valLen > 0) {
+            val = new byte[valLen];
+            payloadBuf.get(val);
+        }
+
+        InternalRecord record = new InternalRecord(ByteKey.copyOf(key), val, kind, seq);
+        return new ParsedFrame(record, totalFrameLen);
+    }
+
+    private record ParsedFrame(InternalRecord record, int totalFrameLen) {}
+
     private static final class WalRecordCursor implements RecordCursor {
         private final ChannelIO channel;
         private final Path path;
@@ -234,64 +260,13 @@ public final class DefaultWalReader implements WalReader {
                     return false;
                 }
 
-                long remaining = fileSize - currentOffset;
-                if (remaining < FRAME_HEADER_LEN) {
-                    throw new CorruptedLogException(path, currentOffset, "Incomplete frame header at offset " + currentOffset);
+                ParsedFrame frame = readAndValidateFrame(channel, path, currentOffset, fileSize);
+                if (frame == null) {
+                    throw new CorruptedLogException(path, currentOffset, "Incomplete frame at offset " + currentOffset);
                 }
 
-                ByteBuffer fixedBuf = ByteBuffer.allocate(FRAME_HEADER_LEN).order(ByteOrder.BIG_ENDIAN);
-                readFully(channel, fixedBuf, currentOffset);
-                fixedBuf.flip();
-
-                int storedCrc = fixedBuf.getInt();
-                long seq = fixedBuf.getLong();
-                byte typeByte = fixedBuf.get();
-                int keyLen = fixedBuf.getInt();
-                int valLen = fixedBuf.getInt();
-
-                RecordKind kind;
-                if (typeByte == 0x01) {
-                    kind = RecordKind.PUT;
-                } else if (typeByte == 0x02) {
-                    kind = RecordKind.DELETE;
-                } else {
-                    throw new CorruptedLogException(path, currentOffset + 12L, "Unknown record type: " + typeByte);
-                }
-
-                if (keyLen < 0 || valLen < 0 || ((long) keyLen + valLen > DefaultWalWriter.MAX_KEY_VALUE_TOTAL_BYTES)) {
-                    throw new CorruptedLogException(path, currentOffset + 13L, "Invalid keyLen (" + keyLen + ") or valLen (" + valLen + ")");
-                }
-
-                int payloadLen = 8 + 1 + 4 + 4 + keyLen + valLen;
-                int totalFrameLen = 4 + payloadLen;
-
-                if (remaining < totalFrameLen) {
-                    throw new CorruptedLogException(path, currentOffset, "Incomplete frame payload at offset " + currentOffset);
-                }
-
-                ByteBuffer payloadBuf = ByteBuffer.allocate(payloadLen).order(ByteOrder.BIG_ENDIAN);
-                readFully(channel, payloadBuf, currentOffset + 4);
-
-                CRC32 crc32 = new CRC32();
-                crc32.update(payloadBuf.array(), 0, payloadLen);
-                int calculatedCrc = (int) crc32.getValue();
-
-                if (storedCrc != calculatedCrc) {
-                    throw new CorruptedLogException(path, currentOffset, String.format("Frame CRC mismatch: stored 0x%08X, calculated 0x%08X", storedCrc, calculatedCrc));
-                }
-
-                payloadBuf.position(8 + 1 + 4 + 4);
-                byte[] key = new byte[keyLen];
-                payloadBuf.get(key);
-
-                byte[] val = null;
-                if (kind == RecordKind.PUT && valLen > 0) {
-                    val = new byte[valLen];
-                    payloadBuf.get(val);
-                }
-
-                currentRecord = new InternalRecord(ByteKey.copyOf(key), val, kind, seq);
-                currentOffset += totalFrameLen;
+                currentRecord = frame.record();
+                currentOffset += frame.totalFrameLen();
                 return true;
 
             } catch (IOException e) {
