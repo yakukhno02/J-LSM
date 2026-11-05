@@ -2,13 +2,13 @@ package io.jlsm.api;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class StorageExceptionTest {
 
@@ -69,9 +69,9 @@ class StorageExceptionTest {
 
     @Test
     @DisplayName("KVDatabase.open delegates to DatabaseFactory")
-    void testDatabaseFactoryOpen() {
-        assertThatThrownBy(() -> KVDatabase.open(Paths.get("test-db"), DatabaseOptions.defaults()))
-                .isInstanceOf(UnsupportedOperationException.class)
-                .hasMessageContaining("Milestone M3");
+    void testDatabaseFactoryOpen(@TempDir Path tempDir) throws Exception {
+        try (KVDatabase db = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            assertThat(db).isNotNull();
+        }
     }
 }

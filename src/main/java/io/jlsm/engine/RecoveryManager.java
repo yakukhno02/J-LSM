@@ -50,7 +50,7 @@ public final class RecoveryManager {
             ManifestSnapshot snapshot = manifestStore.currentSnapshot();
 
             MemTable memTable = new DefaultMemTable();
-            long maxRecoveredSeq = replayUnsealedWals(snapshot, memTable);
+            long maxRecoveredSeq = replayWals(snapshot, memTable);
             long highSequence = Math.max(snapshot.highSequence(), maxRecoveredSeq);
 
             long activeWalId = snapshot.nextFileId();
@@ -128,15 +128,14 @@ public final class RecoveryManager {
         }
     }
 
-    private long replayUnsealedWals(ManifestSnapshot snapshot, MemTable memTable) throws StorageException {
+    private long replayWals(ManifestSnapshot snapshot, MemTable memTable) throws StorageException {
         long highestSeq = 0L;
 
-        List<WalMeta> unsealedWals = snapshot.wals().stream()
-                .filter(w -> !w.isSealed())
+        List<WalMeta> walsToReplay = snapshot.wals().stream()
                 .sorted(Comparator.comparingLong(WalMeta::walId))
                 .toList();
 
-        for (WalMeta wal : unsealedWals) {
+        for (WalMeta wal : walsToReplay) {
             Path walPath = directory.resolve(walFileName(wal.walId()));
             try {
                 ChannelIO channel = storageIO.openReadWrite(walPath);
