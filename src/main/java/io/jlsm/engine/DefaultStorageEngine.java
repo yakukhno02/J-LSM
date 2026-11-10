@@ -21,8 +21,10 @@ import io.jlsm.mem.DefaultMemTable;
 import io.jlsm.mem.MemTable;
 import io.jlsm.merge.DefaultMergedIterator;
 import io.jlsm.sst.DefaultDiskStorageReader;
+import io.jlsm.sst.DefaultSSTableFlusher;
 import io.jlsm.sst.DefaultTableHandle;
 import io.jlsm.sst.DiskStorageReader;
+import io.jlsm.sst.SSTableFlusher;
 import io.jlsm.sst.TableHandle;
 import io.jlsm.wal.DefaultWalWriter;
 import io.jlsm.wal.WalWriter;
@@ -47,6 +49,7 @@ public final class DefaultStorageEngine implements KVDatabase {
     private final LockHandle lockHandle;
     private final ManifestStore manifestStore;
     private final DiskStorageReader diskStorageReader;
+    private final SSTableFlusher sstableFlusher;
 
     private final ReentrantLock stateLock = new ReentrantLock();
     private final Condition capacityAvailable = stateLock.newCondition();
@@ -87,6 +90,7 @@ public final class DefaultStorageEngine implements KVDatabase {
         this.currentEpoch = snapshot.epoch();
         this.nextFileId = snapshot.nextFileId();
         this.diskStorageReader = new DefaultDiskStorageReader();
+        this.sstableFlusher = new DefaultSSTableFlusher(directory, storageIO);
 
         this.liveTables = new ArrayList<>();
         for (TableMeta meta : snapshot.tables()) {
@@ -307,6 +311,7 @@ public final class DefaultStorageEngine implements KVDatabase {
     private void checkAndRotateMemTable() throws StorageException {
         if (activeMemTable.byteSize() >= options.memtableBytes()) {
             rotateMemTable();
+            flushImmutableMemTable();
         }
     }
 
@@ -366,6 +371,60 @@ public final class DefaultStorageEngine implements KVDatabase {
         activeWalWriter = newWalWriter;
     }
 
+    void flushImmutableMemTable() throws StorageException {
+        if (immutableMemTable == null) {
+            return;
+        }
+
+        long sstFileId = nextFileId++;
+        TableMeta tableMeta;
+        try (RecordCursor cursor = immutableMemTable.scan(null, null)) {
+            tableMeta = sstableFlusher.build(sstFileId, cursor);
+        }
+
+        Path sstPath = directory.resolve(String.format("%06d.sst", sstFileId));
+        TableHandle newTableHandle = DefaultTableHandle.open(storageIO, sstPath, tableMeta);
+
+        ManifestSnapshot currentSnapshot = manifestStore.currentSnapshot();
+        List<WalMeta> updatedWals = new ArrayList<>();
+        for (WalMeta wal : currentSnapshot.wals()) {
+            if (wal.walId() != immutableWalId) {
+                updatedWals.add(wal);
+            }
+        }
+
+        List<TableMeta> updatedTables = new ArrayList<>(currentSnapshot.tables());
+        updatedTables.add(tableMeta);
+
+        ManifestSnapshot nextSnapshot = new ManifestSnapshot(
+                ++currentEpoch,
+                nextFileId,
+                highSequence,
+                updatedWals,
+                updatedTables
+        );
+
+        manifestStore.commit(nextSnapshot);
+        try {
+            storageIO.syncDirectory(directory);
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.IO, "Failed to sync directory after flush commit", e);
+        }
+
+        liveTables.add(newTableHandle);
+
+        Path oldWalPath = directory.resolve(String.format("%06d.wal", immutableWalId));
+        try {
+            storageIO.deleteIfExists(oldWalPath);
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.IO, "Failed to delete flushed WAL file: " + oldWalPath, e);
+        }
+
+        immutableMemTable = null;
+        immutableWalId = 0L;
+        capacityAvailable.signalAll();
+    }
+
     MemTable activeMemTable() {
         return activeMemTable;
     }
@@ -380,6 +439,10 @@ public final class DefaultStorageEngine implements KVDatabase {
 
     long immutableWalId() {
         return immutableWalId;
+    }
+
+    List<TableHandle> liveTables() {
+        return List.copyOf(liveTables);
     }
 
     private void ensureOpen() throws StorageException {
