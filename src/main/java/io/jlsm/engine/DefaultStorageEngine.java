@@ -6,6 +6,7 @@ import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.internal.io.ChannelIO;
 import io.jlsm.internal.io.LockHandle;
 import io.jlsm.internal.io.StorageIO;
 import io.jlsm.internal.model.ByteKey;
@@ -15,6 +16,8 @@ import io.jlsm.internal.model.RecordKind;
 import io.jlsm.manifest.ManifestSnapshot;
 import io.jlsm.manifest.ManifestStore;
 import io.jlsm.manifest.TableMeta;
+import io.jlsm.manifest.WalMeta;
+import io.jlsm.mem.DefaultMemTable;
 import io.jlsm.mem.MemTable;
 import io.jlsm.merge.DefaultMergedIterator;
 import io.jlsm.sst.DefaultDiskStorageReader;
@@ -24,6 +27,7 @@ import io.jlsm.sst.TableHandle;
 import io.jlsm.wal.DefaultWalWriter;
 import io.jlsm.wal.WalWriter;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -53,11 +57,12 @@ public final class DefaultStorageEngine implements KVDatabase {
     private MemTable immutableMemTable;
     private WalWriter activeWalWriter;
     private long activeWalId;
+    private long immutableWalId;
     private long highSequence;
     private long nextFileId;
     private long currentEpoch;
 
-    private List<TableHandle> liveTables;
+    private final List<TableHandle> liveTables;
     private boolean closed;
 
     public DefaultStorageEngine(
@@ -97,6 +102,7 @@ public final class DefaultStorageEngine implements KVDatabase {
         stateLock.lock();
         try {
             ensureOpen();
+            checkAndRotateMemTable();
             long seq = ++highSequence;
             activeWalWriter.append(seq, RecordKind.PUT, key, value);
             ByteKey byteKey = ByteKey.copyOf(key);
@@ -162,6 +168,7 @@ public final class DefaultStorageEngine implements KVDatabase {
         stateLock.lock();
         try {
             ensureOpen();
+            checkAndRotateMemTable();
             long seq = ++highSequence;
             activeWalWriter.append(seq, RecordKind.DELETE, key, null);
             ByteKey byteKey = ByteKey.copyOf(key);
@@ -295,6 +302,84 @@ public final class DefaultStorageEngine implements KVDatabase {
         } finally {
             stateLock.unlock();
         }
+    }
+
+    private void checkAndRotateMemTable() throws StorageException {
+        if (activeMemTable.byteSize() >= options.memtableBytes()) {
+            rotateMemTable();
+        }
+    }
+
+    void rotateMemTable() throws StorageException {
+        while (immutableMemTable != null && !closed) {
+            try {
+                capacityAvailable.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new StorageException(ErrorCode.INTERRUPTED, "Interrupted while waiting for immutable MemTable flush", e);
+            }
+        }
+        ensureOpen();
+
+        activeWalWriter.close();
+
+        long newWalId = nextFileId++;
+        WalWriter newWalWriter;
+        try {
+            Path newWalPath = directory.resolve(String.format("%06d.wal", newWalId));
+            ChannelIO channel = storageIO.createNew(newWalPath);
+            newWalWriter = DefaultWalWriter.create(channel, newWalId, options.durabilityMode());
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.IO, "Failed to create new active WAL during rotation", e);
+        }
+
+        List<WalMeta> updatedWals = new ArrayList<>();
+        ManifestSnapshot currentSnapshot = manifestStore.currentSnapshot();
+        for (WalMeta wal : currentSnapshot.wals()) {
+            if (wal.walId() == activeWalId) {
+                updatedWals.add(new WalMeta(wal.walId(), true));
+            } else {
+                updatedWals.add(wal);
+            }
+        }
+        updatedWals.add(new WalMeta(newWalId, false));
+
+        ManifestSnapshot nextSnapshot = new ManifestSnapshot(
+                ++currentEpoch,
+                nextFileId,
+                highSequence,
+                updatedWals,
+                currentSnapshot.tables()
+        );
+        manifestStore.commit(nextSnapshot);
+        try {
+            storageIO.syncDirectory(directory);
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.IO, "Failed to sync directory after WAL rotation", e);
+        }
+
+        immutableMemTable = activeMemTable;
+        immutableWalId = activeWalId;
+
+        activeMemTable = new DefaultMemTable();
+        activeWalId = newWalId;
+        activeWalWriter = newWalWriter;
+    }
+
+    MemTable activeMemTable() {
+        return activeMemTable;
+    }
+
+    MemTable immutableMemTable() {
+        return immutableMemTable;
+    }
+
+    long activeWalId() {
+        return activeWalId;
+    }
+
+    long immutableWalId() {
+        return immutableWalId;
     }
 
     private void ensureOpen() throws StorageException {
