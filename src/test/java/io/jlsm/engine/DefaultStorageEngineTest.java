@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -226,6 +227,95 @@ class DefaultStorageEngineTest {
 
         try (KVDatabase db2 = KVDatabase.open(tempDir, options)) {
             assertThat(db2).isNotNull();
+        }
+    }
+
+    @Test
+    @DisplayName("Automatic MemTable flush when memtableBytes threshold is exceeded")
+    void testAutomaticFlushOnThreshold(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        // 512 bytes threshold to trigger flush quickly
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                512L,
+                defaults.compactionTrigger(),
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+            assertThat(engine.liveTables()).isEmpty();
+
+            // Insert records until threshold is crossed
+            for (int i = 0; i < 20; i++) {
+                db.put(bytes("key_" + i), bytes("value_payload_for_testing_" + i));
+            }
+
+            // Flush should have produced at least 1 live SSTable
+            assertThat(engine.liveTables()).isNotEmpty();
+            assertThat(engine.immutableMemTable()).isNull();
+
+            // Verify all data is readable through get() from SSTable
+            for (int i = 0; i < 20; i++) {
+                assertThat(asString(db.get(bytes("key_" + i)))).isEqualTo("value_payload_for_testing_" + i);
+            }
+
+            // Flushed WAL 000001.wal should have been deleted from disk
+            assertThat(Files.exists(tempDir.resolve("000001.wal"))).isFalse();
+        }
+
+        // Verify persistence after reopening
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            for (int i = 0; i < 20; i++) {
+                assertThat(asString(db.get(bytes("key_" + i)))).isEqualTo("value_payload_for_testing_" + i);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Scan merges flushed SSTable data with active MemTable updates")
+    void testScanAcrossFlushedSSTableAndMemTable(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                512L,
+                defaults.compactionTrigger(),
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            // First batch triggers flush into SSTable
+            db.put(bytes("k1"), bytes("v1_old"));
+            db.put(bytes("k2"), bytes("v2"));
+            for (int i = 0; i < 15; i++) {
+                db.put(bytes("filler_" + i), bytes("filler_val_" + i));
+            }
+
+            // Update in new active MemTable
+            db.put(bytes("k1"), bytes("v1_new"));
+            db.delete(bytes("k2"));
+            db.put(bytes("k3"), bytes("v3"));
+
+            assertThat(asString(db.get(bytes("k1")))).isEqualTo("v1_new");
+            assertThat(db.get(bytes("k2"))).isNull();
+            assertThat(asString(db.get(bytes("k3")))).isEqualTo("v3");
+
+            // Range scan should properly merge and prioritize MemTable over SSTable
+            List<String> scannedKeys = new ArrayList<>();
+            try (ClosableIterator<Entry> it = db.scan(bytes("k1"), bytes("k4"))) {
+                while (it.hasNext()) {
+                    Entry entry = it.next();
+                    scannedKeys.add(asString(entry.key()) + "=" + asString(entry.value()));
+                }
+            }
+
+            assertThat(scannedKeys).containsExactly("k1=v1_new", "k3=v3");
         }
     }
 }
