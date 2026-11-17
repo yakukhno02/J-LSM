@@ -6,6 +6,7 @@ import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.api.StorageMetrics;
 import io.jlsm.compaction.Compactor;
 import io.jlsm.compaction.DefaultCompactor;
 import io.jlsm.internal.io.ChannelIO;
@@ -32,6 +33,7 @@ import io.jlsm.wal.DefaultWalWriter;
 import io.jlsm.wal.WalWriter;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -47,6 +49,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -68,6 +71,13 @@ public final class DefaultStorageEngine implements KVDatabase {
     private final ExecutorService backgroundWorker;
     private final AtomicBoolean isCompacting = new AtomicBoolean(false);
     private final List<ObsoleteTable> obsoleteTables = new CopyOnWriteArrayList<>();
+    private final MemoryBudgetManager memoryBudgetManager;
+    private final AtomicLong putsCount = new AtomicLong(0L);
+    private final AtomicLong getsCount = new AtomicLong(0L);
+    private final AtomicLong deletesCount = new AtomicLong(0L);
+    private final AtomicLong scansCount = new AtomicLong(0L);
+    private final AtomicLong flushCount = new AtomicLong(0L);
+    private final AtomicLong compactionCount = new AtomicLong(0L);
 
     private MemTable activeMemTable;
     private MemTable immutableMemTable;
@@ -111,6 +121,8 @@ public final class DefaultStorageEngine implements KVDatabase {
         this.activeWalWriter = recoveryResult.activeWalWriter();
         this.activeWalId = recoveryResult.activeWalId();
         this.highSequence = recoveryResult.highSequence();
+        this.memoryBudgetManager = new MemoryBudgetManager(options);
+        this.memoryBudgetManager.setAllocated(this.activeMemTable.byteSize());
 
         ManifestSnapshot snapshot = recoveryResult.manifestSnapshot();
         this.currentEpoch = snapshot.epoch();
@@ -144,6 +156,9 @@ public final class DefaultStorageEngine implements KVDatabase {
     @Override
     public void put(byte[] key, byte[] value) throws StorageException {
         validateKeyValue(key, value, false);
+        putsCount.incrementAndGet();
+        long recordBytes = (long) key.length + value.length + 32;
+        memoryBudgetManager.acquire(recordBytes);
 
         stateLock.lock();
         try {
@@ -160,6 +175,7 @@ public final class DefaultStorageEngine implements KVDatabase {
 
     @Override
     public byte[] get(byte[] key) throws StorageException {
+        getsCount.incrementAndGet();
         if (key == null) {
             throw new IllegalArgumentException("key cannot be null");
         }
@@ -208,6 +224,9 @@ public final class DefaultStorageEngine implements KVDatabase {
     @Override
     public void delete(byte[] key) throws StorageException {
         validateKeyValue(key, null, true);
+        deletesCount.incrementAndGet();
+        long recordBytes = (long) key.length + 32;
+        memoryBudgetManager.acquire(recordBytes);
 
         stateLock.lock();
         try {
@@ -224,6 +243,7 @@ public final class DefaultStorageEngine implements KVDatabase {
 
     @Override
     public ClosableIterator<Entry> scan(byte[] fromKey, byte[] toKey) throws StorageException {
+        scansCount.incrementAndGet();
         ByteKey from = fromKey != null ? ByteKey.copyOf(fromKey) : null;
         ByteKey to = toKey != null ? ByteKey.copyOf(toKey) : null;
 
@@ -300,6 +320,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             closed = true;
 
             backgroundWorker.shutdown();
+            memoryBudgetManager.close();
         } finally {
             stateLock.unlock();
         }
@@ -367,7 +388,7 @@ public final class DefaultStorageEngine implements KVDatabase {
     }
 
     private void checkAndRotateMemTable() throws StorageException {
-        if (activeMemTable.byteSize() >= options.memtableBytes()) {
+        if (activeMemTable.byteSize() >= options.memtableBytes() || memoryBudgetManager.isUnderMemoryPressure()) {
             rotateMemTable();
             flushImmutableMemTable();
         }
@@ -485,8 +506,11 @@ public final class DefaultStorageEngine implements KVDatabase {
                 throw new StorageException(ErrorCode.IO, "Failed to delete flushed WAL file: " + oldWalPath, e);
             }
 
+            long flushedMem = immutableMemTable.byteSize();
             immutableMemTable = null;
             immutableWalId = 0L;
+            flushCount.incrementAndGet();
+            memoryBudgetManager.release(flushedMem);
             capacityAvailable.signalAll();
 
             if (liveTables.size() >= options.compactionTrigger()) {
@@ -626,6 +650,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             if (newTableHandle != null) {
                 liveTables.add(newTableHandle);
             }
+            compactionCount.incrementAndGet();
 
             for (TableHandle handle : pinnedInputs) {
                 Path sstPath = directory.resolve(String.format("%06d.sst", handle.id()));
@@ -690,6 +715,58 @@ public final class DefaultStorageEngine implements KVDatabase {
             }
             return false;
         });
+    }
+
+        @Override
+    public StorageMetrics metrics() throws StorageException {
+        stateLock.lock();
+        try {
+            ensureOpen();
+            long activeMem = activeMemTable != null ? activeMemTable.byteSize() : 0L;
+            long immMem = immutableMemTable != null ? immutableMemTable.byteSize() : 0L;
+            long totalMem = activeMem + immMem;
+
+            long totalSstBytes = 0L;
+            for (TableHandle handle : liveTables) {
+                totalSstBytes += handle.fileSize();
+            }
+
+            long totalWalBytes = 0L;
+            ManifestSnapshot snapshot = manifestStore.currentSnapshot();
+            for (WalMeta wal : snapshot.wals()) {
+                Path walPath = directory.resolve(RecoveryManager.walFileName(wal.walId()));
+                try {
+                    if (Files.exists(walPath)) {
+                        totalWalBytes += Files.size(walPath);
+                    }
+                } catch (IOException ignored) {}
+            }
+
+            return new StorageMetrics(
+                    putsCount.get(),
+                    getsCount.get(),
+                    deletesCount.get(),
+                    scansCount.get(),
+                    activeMem,
+                    immMem,
+                    totalMem,
+                    memoryBudgetManager.maxBudgetBytes(),
+                    liveTables.size(),
+                    totalSstBytes,
+                    totalWalBytes,
+                    openScans.size(),
+                    flushCount.get(),
+                    compactionCount.get(),
+                    memoryBudgetManager.backpressureWaitNanos(),
+                    highSequence
+            );
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    MemoryBudgetManager memoryBudgetManager() {
+        return memoryBudgetManager;
     }
 
     MemTable activeMemTable() {
