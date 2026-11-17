@@ -6,6 +6,8 @@ import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.compaction.Compactor;
+import io.jlsm.compaction.DefaultCompactor;
 import io.jlsm.internal.io.ChannelIO;
 import io.jlsm.internal.io.LockHandle;
 import io.jlsm.internal.io.StorageIO;
@@ -32,12 +34,19 @@ import io.jlsm.wal.WalWriter;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -50,11 +59,15 @@ public final class DefaultStorageEngine implements KVDatabase {
     private final ManifestStore manifestStore;
     private final DiskStorageReader diskStorageReader;
     private final SSTableFlusher sstableFlusher;
+    private final Compactor compactor;
 
     private final ReentrantLock stateLock = new ReentrantLock();
     private final Condition capacityAvailable = stateLock.newCondition();
 
     private final Set<ClosableIterator<?>> openScans = ConcurrentHashMap.newKeySet();
+    private final ExecutorService backgroundWorker;
+    private final AtomicBoolean isCompacting = new AtomicBoolean(false);
+    private final List<ObsoleteTable> obsoleteTables = new CopyOnWriteArrayList<>();
 
     private MemTable activeMemTable;
     private MemTable immutableMemTable;
@@ -68,16 +81,29 @@ public final class DefaultStorageEngine implements KVDatabase {
     private final List<TableHandle> liveTables;
     private boolean closed;
 
+    private record ObsoleteTable(long tableId, Path path, TableHandle handle) {}
+
     public DefaultStorageEngine(
             StorageIO storageIO,
             Path directory,
             DatabaseOptions options,
             RecoveryResult recoveryResult
     ) throws StorageException {
+        this(storageIO, directory, options, recoveryResult, new DefaultCompactor(directory, storageIO));
+    }
+
+    public DefaultStorageEngine(
+            StorageIO storageIO,
+            Path directory,
+            DatabaseOptions options,
+            RecoveryResult recoveryResult,
+            Compactor compactor
+    ) throws StorageException {
         this.storageIO = Objects.requireNonNull(storageIO, "storageIO cannot be null");
         this.directory = Objects.requireNonNull(directory, "directory cannot be null");
         this.options = Objects.requireNonNull(options, "options cannot be null");
         Objects.requireNonNull(recoveryResult, "recoveryResult cannot be null");
+        this.compactor = Objects.requireNonNull(compactor, "compactor cannot be null");
 
         this.lockHandle = recoveryResult.lockHandle();
         this.manifestStore = recoveryResult.manifestStore();
@@ -92,10 +118,26 @@ public final class DefaultStorageEngine implements KVDatabase {
         this.diskStorageReader = new DefaultDiskStorageReader();
         this.sstableFlusher = new DefaultSSTableFlusher(directory, storageIO);
 
+        this.backgroundWorker = Executors.newSingleThreadExecutor(new ThreadFactory() {
+            private final ThreadFactory defaultFactory = Executors.defaultThreadFactory();
+
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = defaultFactory.newThread(r);
+                t.setName("jlsm-worker-" + directory.getFileName());
+                t.setDaemon(true);
+                return t;
+            }
+        });
+
         this.liveTables = new ArrayList<>();
         for (TableMeta meta : snapshot.tables()) {
             Path sstPath = directory.resolve(String.format("%06d.sst", meta.tableId()));
             this.liveTables.add(DefaultTableHandle.open(storageIO, sstPath, meta));
+        }
+
+        if (this.liveTables.size() >= options.compactionTrigger()) {
+            scheduleCompaction();
         }
     }
 
@@ -123,8 +165,6 @@ public final class DefaultStorageEngine implements KVDatabase {
         }
 
         ByteKey byteKey = ByteKey.copyOf(key);
-        MemTable active;
-        MemTable imm;
         List<TableHandle> pinnedTables;
 
         stateLock.lock();
@@ -259,12 +299,30 @@ public final class DefaultStorageEngine implements KVDatabase {
             }
             closed = true;
 
+            backgroundWorker.shutdown();
+        } finally {
+            stateLock.unlock();
+        }
+
+        try {
+            if (!backgroundWorker.awaitTermination(5, TimeUnit.SECONDS)) {
+                backgroundWorker.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            backgroundWorker.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+
+        stateLock.lock();
+        try {
             for (ClosableIterator<?> it : List.copyOf(openScans)) {
                 try {
                     it.close();
                 } catch (Exception ignored) {}
             }
             openScans.clear();
+
+            cleanObsoleteTables();
 
             StorageException firstException = null;
 
@@ -316,113 +374,322 @@ public final class DefaultStorageEngine implements KVDatabase {
     }
 
     void rotateMemTable() throws StorageException {
-        while (immutableMemTable != null && !closed) {
+        stateLock.lock();
+        try {
+            while (immutableMemTable != null && !closed) {
+                try {
+                    capacityAvailable.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new StorageException(ErrorCode.INTERRUPTED, "Interrupted while waiting for immutable MemTable flush", e);
+                }
+            }
+            ensureOpen();
+
+            activeWalWriter.close();
+
+            long newWalId = nextFileId++;
+            WalWriter newWalWriter;
             try {
-                capacityAvailable.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new StorageException(ErrorCode.INTERRUPTED, "Interrupted while waiting for immutable MemTable flush", e);
+                Path newWalPath = directory.resolve(String.format("%06d.wal", newWalId));
+                ChannelIO channel = storageIO.createNew(newWalPath);
+                newWalWriter = DefaultWalWriter.create(channel, newWalId, options.durabilityMode());
+            } catch (IOException e) {
+                throw new StorageException(ErrorCode.IO, "Failed to create new active WAL during rotation", e);
             }
-        }
-        ensureOpen();
 
-        activeWalWriter.close();
-
-        long newWalId = nextFileId++;
-        WalWriter newWalWriter;
-        try {
-            Path newWalPath = directory.resolve(String.format("%06d.wal", newWalId));
-            ChannelIO channel = storageIO.createNew(newWalPath);
-            newWalWriter = DefaultWalWriter.create(channel, newWalId, options.durabilityMode());
-        } catch (IOException e) {
-            throw new StorageException(ErrorCode.IO, "Failed to create new active WAL during rotation", e);
-        }
-
-        List<WalMeta> updatedWals = new ArrayList<>();
-        ManifestSnapshot currentSnapshot = manifestStore.currentSnapshot();
-        for (WalMeta wal : currentSnapshot.wals()) {
-            if (wal.walId() == activeWalId) {
-                updatedWals.add(new WalMeta(wal.walId(), true));
-            } else {
-                updatedWals.add(wal);
+            List<WalMeta> updatedWals = new ArrayList<>();
+            ManifestSnapshot currentSnapshot = manifestStore.currentSnapshot();
+            for (WalMeta wal : currentSnapshot.wals()) {
+                if (wal.walId() == activeWalId) {
+                    updatedWals.add(new WalMeta(wal.walId(), true));
+                } else {
+                    updatedWals.add(wal);
+                }
             }
+            updatedWals.add(new WalMeta(newWalId, false));
+
+            ManifestSnapshot nextSnapshot = new ManifestSnapshot(
+                    ++currentEpoch,
+                    nextFileId,
+                    highSequence,
+                    updatedWals,
+                    currentSnapshot.tables()
+            );
+            manifestStore.commit(nextSnapshot);
+            try {
+                storageIO.syncDirectory(directory);
+            } catch (IOException e) {
+                throw new StorageException(ErrorCode.IO, "Failed to sync directory after WAL rotation", e);
+            }
+
+            immutableMemTable = activeMemTable;
+            immutableWalId = activeWalId;
+
+            activeMemTable = new DefaultMemTable();
+            activeWalId = newWalId;
+            activeWalWriter = newWalWriter;
+        } finally {
+            stateLock.unlock();
         }
-        updatedWals.add(new WalMeta(newWalId, false));
-
-        ManifestSnapshot nextSnapshot = new ManifestSnapshot(
-                ++currentEpoch,
-                nextFileId,
-                highSequence,
-                updatedWals,
-                currentSnapshot.tables()
-        );
-        manifestStore.commit(nextSnapshot);
-        try {
-            storageIO.syncDirectory(directory);
-        } catch (IOException e) {
-            throw new StorageException(ErrorCode.IO, "Failed to sync directory after WAL rotation", e);
-        }
-
-        immutableMemTable = activeMemTable;
-        immutableWalId = activeWalId;
-
-        activeMemTable = new DefaultMemTable();
-        activeWalId = newWalId;
-        activeWalWriter = newWalWriter;
     }
 
     void flushImmutableMemTable() throws StorageException {
-        if (immutableMemTable == null) {
+        stateLock.lock();
+        try {
+            if (immutableMemTable == null) {
+                return;
+            }
+
+            long sstFileId = nextFileId++;
+            TableMeta tableMeta;
+            try (RecordCursor cursor = immutableMemTable.scan(null, null)) {
+                tableMeta = sstableFlusher.build(sstFileId, cursor);
+            }
+
+            Path sstPath = directory.resolve(String.format("%06d.sst", sstFileId));
+            TableHandle newTableHandle = DefaultTableHandle.open(storageIO, sstPath, tableMeta);
+
+            ManifestSnapshot currentSnapshot = manifestStore.currentSnapshot();
+            List<WalMeta> updatedWals = new ArrayList<>();
+            for (WalMeta wal : currentSnapshot.wals()) {
+                if (wal.walId() != immutableWalId) {
+                    updatedWals.add(wal);
+                }
+            }
+
+            List<TableMeta> updatedTables = new ArrayList<>(currentSnapshot.tables());
+            updatedTables.add(tableMeta);
+
+            ManifestSnapshot nextSnapshot = new ManifestSnapshot(
+                    ++currentEpoch,
+                    nextFileId,
+                    highSequence,
+                    updatedWals,
+                    updatedTables
+            );
+
+            manifestStore.commit(nextSnapshot);
+            try {
+                storageIO.syncDirectory(directory);
+            } catch (IOException e) {
+                throw new StorageException(ErrorCode.IO, "Failed to sync directory after flush commit", e);
+            }
+
+            liveTables.add(newTableHandle);
+
+            Path oldWalPath = directory.resolve(String.format("%06d.wal", immutableWalId));
+            try {
+                storageIO.deleteIfExists(oldWalPath);
+            } catch (IOException e) {
+                throw new StorageException(ErrorCode.IO, "Failed to delete flushed WAL file: " + oldWalPath, e);
+            }
+
+            immutableMemTable = null;
+            immutableWalId = 0L;
+            capacityAvailable.signalAll();
+
+            if (liveTables.size() >= options.compactionTrigger()) {
+                scheduleCompaction();
+            }
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    void scheduleCompaction() {
+        if (closed || isCompacting.get()) {
             return;
         }
+        backgroundWorker.submit(() -> {
+            try {
+                performCompaction(false);
+            } catch (Throwable t) {
+                // Keep worker running across compaction errors
+            }
+        });
+    }
 
-        long sstFileId = nextFileId++;
-        TableMeta tableMeta;
-        try (RecordCursor cursor = immutableMemTable.scan(null, null)) {
-            tableMeta = sstableFlusher.build(sstFileId, cursor);
+    void performCompaction(boolean force) throws StorageException {
+        if (!isCompacting.compareAndSet(false, true)) {
+            return;
+        }
+        List<TableHandle> pinnedInputs;
+        long outputId;
+        stateLock.lock();
+        try {
+            int minTables = force ? 1 : options.compactionTrigger();
+            if (closed || liveTables.size() < minTables) {
+                isCompacting.set(false);
+                return;
+            }
+            pinnedInputs = new ArrayList<>(liveTables);
+            for (TableHandle handle : pinnedInputs) {
+                if (handle instanceof DefaultTableHandle defHandle) {
+                    defHandle.pin();
+                }
+            }
+            outputId = nextFileId++;
+        } finally {
+            stateLock.unlock();
         }
 
-        Path sstPath = directory.resolve(String.format("%06d.sst", sstFileId));
-        TableHandle newTableHandle = DefaultTableHandle.open(storageIO, sstPath, tableMeta);
+        Optional<TableMeta> compactedMeta;
+        try {
+            compactedMeta = compactor.build(outputId, pinnedInputs, false);
+        } catch (Exception e) {
+            for (TableHandle handle : pinnedInputs) {
+                if (handle instanceof DefaultTableHandle defHandle) {
+                    defHandle.unpin();
+                }
+            }
+            isCompacting.set(false);
+            if (e instanceof StorageException se) {
+                throw se;
+            }
+            throw new StorageException(ErrorCode.IO, "Compaction failed during build", e);
+        }
 
-        ManifestSnapshot currentSnapshot = manifestStore.currentSnapshot();
-        List<WalMeta> updatedWals = new ArrayList<>();
-        for (WalMeta wal : currentSnapshot.wals()) {
-            if (wal.walId() != immutableWalId) {
-                updatedWals.add(wal);
+        TableHandle newTableHandle = null;
+        if (compactedMeta.isPresent()) {
+            Path newSstPath = directory.resolve(String.format("%06d.sst", outputId));
+            try {
+                newTableHandle = DefaultTableHandle.open(storageIO, newSstPath, compactedMeta.get());
+            } catch (Exception e) {
+                for (TableHandle handle : pinnedInputs) {
+                    if (handle instanceof DefaultTableHandle defHandle) {
+                        defHandle.unpin();
+                    }
+                }
+                try {
+                    storageIO.deleteIfExists(newSstPath);
+                } catch (IOException ignored) {}
+                isCompacting.set(false);
+                if (e instanceof StorageException se) {
+                    throw se;
+                }
+                throw new StorageException(ErrorCode.IO, "Failed to open newly compacted table", e);
             }
         }
 
-        List<TableMeta> updatedTables = new ArrayList<>(currentSnapshot.tables());
-        updatedTables.add(tableMeta);
-
-        ManifestSnapshot nextSnapshot = new ManifestSnapshot(
-                ++currentEpoch,
-                nextFileId,
-                highSequence,
-                updatedWals,
-                updatedTables
-        );
-
-        manifestStore.commit(nextSnapshot);
-        try {
-            storageIO.syncDirectory(directory);
-        } catch (IOException e) {
-            throw new StorageException(ErrorCode.IO, "Failed to sync directory after flush commit", e);
+        Set<Long> compactedTableIds = new HashSet<>();
+        for (TableHandle handle : pinnedInputs) {
+            compactedTableIds.add(handle.id());
         }
 
-        liveTables.add(newTableHandle);
-
-        Path oldWalPath = directory.resolve(String.format("%06d.wal", immutableWalId));
+        stateLock.lock();
         try {
-            storageIO.deleteIfExists(oldWalPath);
-        } catch (IOException e) {
-            throw new StorageException(ErrorCode.IO, "Failed to delete flushed WAL file: " + oldWalPath, e);
+            if (closed) {
+                if (newTableHandle != null) {
+                    try {
+                        newTableHandle.close();
+                    } catch (Exception ignored) {}
+                    try {
+                        Path newSstPath = directory.resolve(String.format("%06d.sst", outputId));
+                        storageIO.deleteIfExists(newSstPath);
+                    } catch (IOException ignored) {}
+                }
+                for (TableHandle handle : pinnedInputs) {
+                    if (handle instanceof DefaultTableHandle defHandle) {
+                        defHandle.unpin();
+                    }
+                }
+                return;
+            }
+
+            ManifestSnapshot currentSnapshot = manifestStore.currentSnapshot();
+            List<TableMeta> updatedTables = new ArrayList<>();
+            for (TableMeta meta : currentSnapshot.tables()) {
+                if (!compactedTableIds.contains(meta.tableId())) {
+                    updatedTables.add(meta);
+                }
+            }
+            if (compactedMeta.isPresent()) {
+                updatedTables.add(compactedMeta.get());
+            }
+
+            ManifestSnapshot nextSnapshot = new ManifestSnapshot(
+                    ++currentEpoch,
+                    nextFileId,
+                    highSequence,
+                    currentSnapshot.wals(),
+                    updatedTables
+            );
+            manifestStore.commit(nextSnapshot);
+            try {
+                storageIO.syncDirectory(directory);
+            } catch (IOException e) {
+                throw new StorageException(ErrorCode.IO, "Failed to sync directory after compaction commit", e);
+            }
+
+            liveTables.removeIf(t -> compactedTableIds.contains(t.id()));
+            if (newTableHandle != null) {
+                liveTables.add(newTableHandle);
+            }
+
+            for (TableHandle handle : pinnedInputs) {
+                Path sstPath = directory.resolve(String.format("%06d.sst", handle.id()));
+                obsoleteTables.add(new ObsoleteTable(handle.id(), sstPath, handle));
+                handle.close();
+                if (handle instanceof DefaultTableHandle defHandle) {
+                    defHandle.unpin();
+                }
+            }
+
+            cleanObsoleteTables();
+            capacityAvailable.signalAll();
+        } finally {
+            isCompacting.set(false);
+            stateLock.unlock();
         }
 
-        immutableMemTable = null;
-        immutableWalId = 0L;
-        capacityAvailable.signalAll();
+        stateLock.lock();
+        try {
+            if (!closed && liveTables.size() >= options.compactionTrigger()) {
+                scheduleCompaction();
+            }
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    void awaitBackgroundTasks() throws InterruptedException {
+        try {
+            backgroundWorker.submit(() -> {}).get(10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            if (e instanceof InterruptedException ie) {
+                throw ie;
+            }
+        }
+    }
+
+    void triggerCompactionSync() throws StorageException {
+        try {
+            awaitBackgroundTasks();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        performCompaction(true);
+    }
+
+    private void cleanObsoleteTables() {
+        obsoleteTables.removeIf(obs -> {
+            boolean canDelete;
+            if (obs.handle() instanceof DefaultTableHandle defHandle) {
+                canDelete = defHandle.isClosed();
+            } else {
+                canDelete = true;
+            }
+            if (canDelete) {
+                try {
+                    storageIO.deleteIfExists(obs.path());
+                    return true;
+                } catch (IOException e) {
+                    return false;
+                }
+            }
+            return false;
+        });
     }
 
     MemTable activeMemTable() {
@@ -443,6 +710,14 @@ public final class DefaultStorageEngine implements KVDatabase {
 
     List<TableHandle> liveTables() {
         return List.copyOf(liveTables);
+    }
+
+    List<Path> obsoleteTablePaths() {
+        List<Path> paths = new ArrayList<>();
+        for (ObsoleteTable table : obsoleteTables) {
+            paths.add(table.path());
+        }
+        return paths;
     }
 
     private void ensureOpen() throws StorageException {
@@ -529,6 +804,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                         defHandle.unpin();
                     }
                 }
+                cleanObsoleteTables();
             }
         }
     }

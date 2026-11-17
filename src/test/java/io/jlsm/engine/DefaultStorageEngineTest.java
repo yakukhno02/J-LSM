@@ -318,4 +318,208 @@ class DefaultStorageEngineTest {
             assertThat(scannedKeys).containsExactly("k1=v1_new", "k3=v3");
         }
     }
+
+    @Test
+    @DisplayName("Automatic compaction triggers when live tables reach compactionTrigger")
+    void testAutomaticCompactionOnTrigger(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                1024L,
+                4,
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+
+            // Trigger exactly 4 flushes into 4 live SSTables
+            for (int batch = 0; batch < 4; batch++) {
+                for (int i = 0; i < 25; i++) {
+                    db.put(bytes("b" + batch + "_k" + i), bytes("v" + batch + "_" + i));
+                }
+                engine.rotateMemTable();
+                engine.flushImmutableMemTable();
+            }
+
+            // Wait for background worker to complete compaction
+            long deadline = System.currentTimeMillis() + 5000;
+            while (engine.liveTables().size() > 1 && System.currentTimeMillis() < deadline) {
+                engine.awaitBackgroundTasks();
+                Thread.sleep(50);
+            }
+
+            assertThat(engine.liveTables()).hasSize(1);
+
+            for (int batch = 0; batch < 4; batch++) {
+                for (int i = 0; i < 25; i++) {
+                    assertThat(asString(db.get(bytes("b" + batch + "_k" + i))))
+                            .isEqualTo("v" + batch + "_" + i);
+                }
+            }
+
+            assertThat(Files.exists(tempDir.resolve("000001.sst"))).isFalse();
+            assertThat(Files.exists(tempDir.resolve("000002.sst"))).isFalse();
+            assertThat(Files.exists(tempDir.resolve("000003.sst"))).isFalse();
+            assertThat(Files.exists(tempDir.resolve("000004.sst"))).isFalse();
+        }
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+            assertThat(engine.liveTables()).hasSize(1);
+            for (int batch = 0; batch < 4; batch++) {
+                for (int i = 0; i < 25; i++) {
+                    assertThat(asString(db.get(bytes("b" + batch + "_k" + i))))
+                            .isEqualTo("v" + batch + "_" + i);
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Compaction purges tombstones when consolidating all live tables")
+    void testCompactionPurgesTombstones(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                256L,
+                2,
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+
+            db.put(bytes("k1"), bytes("v1"));
+            db.put(bytes("k2"), bytes("v2"));
+            db.put(bytes("k3"), bytes("v3"));
+            for (int i = 0; i < 10; i++) {
+                db.put(bytes("filler1_" + i), bytes("f1_" + i));
+            }
+
+            db.delete(bytes("k1"));
+            db.put(bytes("k2"), bytes("v2_new"));
+            db.delete(bytes("k3"));
+            for (int i = 0; i < 10; i++) {
+                db.put(bytes("filler2_" + i), bytes("f2_" + i));
+            }
+
+            long deadline = System.currentTimeMillis() + 5000;
+            while (engine.liveTables().size() > 1 && System.currentTimeMillis() < deadline) {
+                engine.awaitBackgroundTasks();
+                Thread.sleep(50);
+            }
+
+            assertThat(engine.liveTables()).hasSize(1);
+            assertThat(db.get(bytes("k1"))).isNull();
+            assertThat(asString(db.get(bytes("k2")))).isEqualTo("v2_new");
+            assertThat(db.get(bytes("k3"))).isNull();
+
+            List<String> keys = new ArrayList<>();
+            try (ClosableIterator<Entry> it = db.scan(bytes("k1"), bytes("k4"))) {
+                while (it.hasNext()) {
+                    keys.add(asString(it.next().key()));
+                }
+            }
+            assertThat(keys).containsExactly("k2");
+        }
+    }
+
+    @Test
+    @DisplayName("Active scan prevents deletion of obsolete SSTables until closed")
+    void testActiveScanPinsSSTablesDuringCompaction(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                256L,
+                10,
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+
+            for (int i = 0; i < 10; i++) {
+                db.put(bytes("a_" + i), bytes("val_a_" + i));
+            }
+            for (int i = 0; i < 10; i++) {
+                db.put(bytes("b_" + i), bytes("val_b_" + i));
+            }
+
+            engine.rotateMemTable();
+            engine.flushImmutableMemTable();
+
+            assertThat(engine.liveTables().size()).isGreaterThanOrEqualTo(2);
+
+            ClosableIterator<Entry> activeScan = db.scan(null, null);
+
+            engine.triggerCompactionSync();
+
+            assertThat(engine.liveTables()).hasSize(1);
+            assertThat(engine.obsoleteTablePaths()).isNotEmpty();
+            for (Path obsolete : engine.obsoleteTablePaths()) {
+                assertThat(Files.exists(obsolete)).isTrue();
+            }
+
+            int count = 0;
+            while (activeScan.hasNext()) {
+                activeScan.next();
+                count++;
+            }
+            assertThat(count).isGreaterThan(0);
+
+            activeScan.close();
+
+            for (Path obsolete : engine.obsoleteTablePaths()) {
+                assertThat(Files.exists(obsolete)).isFalse();
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Compaction when all keys are deleted results in 0 tables")
+    void testCompactionWhenAllRecordsArePurgedResultsInZeroTables(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                256L,
+                2,
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+
+            db.put(bytes("only_key"), bytes("only_val"));
+            db.delete(bytes("only_key"));
+
+            engine.rotateMemTable();
+            engine.flushImmutableMemTable();
+            engine.rotateMemTable();
+            engine.flushImmutableMemTable();
+
+            engine.triggerCompactionSync();
+
+            assertThat(engine.liveTables()).isEmpty();
+            assertThat(db.get(bytes("only_key"))).isNull();
+        }
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+            assertThat(engine.liveTables()).isEmpty();
+            assertThat(db.get(bytes("only_key"))).isNull();
+        }
+    }
 }
