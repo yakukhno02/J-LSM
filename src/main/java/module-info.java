@@ -9,4 +9,5 @@ module io.jlsm {
     exports io.jlsm.wal;
     exports io.jlsm.merge;
     exports io.jlsm.engine;
+    exports io.jlsm.cli;
 }
