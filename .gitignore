@@ -1,4 +1,4 @@
- ==========================================
+# ==========================================
 # Maven / Build Artifacts
 # ==========================================
 target/
@@ -94,10 +94,21 @@ $RECYCLE.BIN/
 # ==========================================
 # J-LSM Runtime / Temporary Test Data
 # ==========================================
+*.wal
+*.sst
 *.wal.tmp
 *.sst.tmp
+MANIFEST
+MANIFEST.tmp
+LOCK
+BACKUP_META
 data/
 test-db/
 tmp/
+jlsm-data/
+jlsm-demo/
+jlsm-bench/
+jlsm-backup/
+backup-*/
 
 skills
