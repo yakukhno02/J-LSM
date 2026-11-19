@@ -118,12 +118,7 @@ public final class JLsmCli {
             return 0;
         }
         if ("dump-sst".equals(cmd)) {
-            if (tokens.size() < 2) {
-                out.println("Usage: dump-sst <file.sst>");
-                return 1;
-            }
-            Path sstPath = resolveSstPath(directory, tokens.get(1));
-            SSTableInspector.dumpSSTable(sstPath, out);
+            dumpSstCommand(directory, tokens, out);
             return 0;
         }
 
@@ -250,14 +245,7 @@ public final class JLsmCli {
             }
             case "metrics", "stats" -> printMetricsDashboard(db.metrics(), out);
             case "inspect", "diag" -> printDiagnostics(directory, out);
-            case "dump-sst" -> {
-                if (tokens.size() < 2) {
-                    out.println("Usage: dump-sst <file.sst>");
-                    return;
-                }
-                Path sstPath = resolveSstPath(directory, tokens.get(1));
-                SSTableInspector.dumpSSTable(sstPath, out);
-            }
+            case "dump-sst" -> dumpSstCommand(directory, tokens, out);
             case "backup" -> {
                 if (tokens.size() < 2) {
                     out.println("Usage: backup <backupDir>");
@@ -320,8 +308,8 @@ public final class JLsmCli {
      * 4. SSTable 4KB Block & Sparse Index binary inspection
      * 5. Crash Recovery after simulated torn WAL frame at EOF (FI-01)
      */
-    public static void runGuidedDemo(Path demoRoot, PrintStream out) throws Exception {
-        Path dbDir = demoRoot.resolve("demo-db");
+    public static void runGuidedDemo(Path dbDir, PrintStream out) throws Exception {
+        deleteDirectoryQuietly(dbDir);
         Files.createDirectories(dbDir);
 
         printBanner(out);
@@ -499,6 +487,32 @@ public final class JLsmCli {
             tokens.add(current.toString());
         }
         return tokens;
+    }
+
+    private static void dumpSstCommand(Path directory, List<String> tokens, PrintStream out) throws Exception {
+        if (tokens.size() >= 2) {
+            Path target = resolveSstPath(directory, tokens.get(1));
+            if (Files.exists(target)) {
+                SSTableInspector.dumpSSTable(target, out);
+                return;
+            }
+            Path fallback = findFirstSstFile(directory);
+            if (fallback != null) {
+                out.printf("[INFO] File '%s' was not found (or already compacted); dumping active SSTable '%s' instead:%n",
+                        tokens.get(1), fallback.getFileName());
+                SSTableInspector.dumpSSTable(fallback, out);
+                return;
+            }
+            SSTableInspector.dumpSSTable(target, out);
+            return;
+        }
+
+        Path firstSst = findFirstSstFile(directory);
+        if (firstSst == null) {
+            out.println("No .sst files found in " + directory + ". Usage: dump-sst [file.sst]");
+            return;
+        }
+        SSTableInspector.dumpSSTable(firstSst, out);
     }
 
     private static Path resolveSstPath(Path directory, String fileArg) {

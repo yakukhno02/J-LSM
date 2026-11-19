@@ -61,10 +61,10 @@ java -jar target/j-lsm-1.0.0-SNAPSHOT.jar --dir ./jlsm-demo demo
 java -jar target/j-lsm-1.0.0-SNAPSHOT.jar --dir ./jlsm-bench --durability BUFFERED benchmark 5000 128
 
 # 4. Діагностика цілісності MANIFEST, WAL, SSTable та розподілу дискового простору
-java -jar target/j-lsm-1.0.0-SNAPSHOT.jar --dir ./jlsm-data inspect
+java -jar target/j-lsm-1.0.0-SNAPSHOT.jar --dir ./jlsm-demo inspect
 
 # 5. Побайтова інспекція структури SSTable (Header JSST, 4KB Data Blocks, Sparse Index, Footer JLSM)
-java -jar target/j-lsm-1.0.0-SNAPSHOT.jar --dir ./jlsm-data dump-sst 000002.sst
+java -jar target/j-lsm-1.0.0-SNAPSHOT.jar --dir ./jlsm-demo dump-sst
 ```
 
 ### Основні команди інтерактивної консолі (`j-lsm>`):
