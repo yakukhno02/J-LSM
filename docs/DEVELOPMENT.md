@@ -83,7 +83,7 @@ flowchart TD
 | **Manifest Store** | `io.jlsm.manifest` | **Dev 1** | `internal.io` | Журнал стану (Catalog), атомарний commit add/remove |
 | **SSTable Codecs** | `io.jlsm.sst` | **Dev 2** | `internal.io`, `model` | Блоки 4 КБ, `SparseIndex`, `Footer`, `TableHandle`, `BloomFilter` (Scope Extension) |
 | **Merging Cursors** | `io.jlsm.merge` | **Dev 2** | `internal.model` | K-way merge курсор, дедуплікація за Sequence Number |
-| **Compactor** | `io.jlsm.compaction` | **Dev 2** | `sst`, `merge` | Чистий білдер злиття SSTables (без зміни маніфесту) |
+| **Compactor** | `io.jlsm.compaction` | **Dev 2** | `sst`, `merge` | Білдер злиття SSTables із розбиттям на цільові розміри (SSTable Splitting, Scope Extension) |
 | **Engine & API** | `io.jlsm.engine`, `api` | **Dev 1** | Усі модулі | Оркестрація, блокування, фоновий воркер, публікація |
 
 ## 3. Точні інтерфейси та моделі даних (Shared Contracts)
@@ -824,7 +824,7 @@ gantt
 
 * **Віха M8 (Scope Extension — добір до ≥ 3 000 core LOC на людину):**
   * **Dev 1:** Атомарні пакети запису `WriteBatch` (інтерфейс, бінарний кадр WAL 0x03 BATCH, все-або-нічого відновлення, тест стійкості R-03 та property-тест P-06).
-  * **Dev 2:** Фільтри Блума для SSTable (бітові масиви $m/n \approx 10$, хешування, інтеграція у точковий пошук `get()`, тест P-07).
+  * **Dev 2:** Фільтри Блума для SSTable (`BloomFilter`, хешування, інтеграція в точковий пошук, тест P-07) та розширений `Compactor` з розбиттям вихідного потоку на таблиці фіксованого розміру (SSTable Splitting / Size-Tiered злиття з поверненням `List<TableMeta>`).
 * **Віха M9:** Фінальний прогін мутаційного тестування **Pitest (≥ 80%)**, лінійне покриття **≥ 90%**, аудит обсягу коду ядра (разом ≥ 6 000 LOC на команду) та захист проєкту.
 
 ## 8. Definition of Done (Критерії готовності)
