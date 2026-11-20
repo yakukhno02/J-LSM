@@ -54,12 +54,7 @@ public final class DefaultCompactor implements Compactor {
         try {
             for (TableHandle handle : pinnedInputs) {
                 Objects.requireNonNull(handle, "pinnedInputs cannot contain null TableHandle");
-                if (handle instanceof DefaultTableHandle defaultHandle) {
-                    cursors.add(defaultHandle.scan(null, null));
-                } else {
-                    throw new StorageException(ErrorCode.UNSUPPORTED_STORAGE,
-                            "Unsupported TableHandle implementation: " + handle.getClass().getName());
-                }
+                cursors.add(handle.scan(null, null));
             }
         } catch (Exception e) {
             closeQuietly(cursors);

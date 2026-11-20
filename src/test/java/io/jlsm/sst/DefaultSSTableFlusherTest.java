@@ -51,13 +51,13 @@ class DefaultSSTableFlusherTest {
         }
 
         List<InternalRecord> records = List.of(
-                new InternalRecord(
+                InternalRecord.of(
                         ByteKey.copyOf("key1".getBytes(StandardCharsets.UTF_8)),
                         "value1".getBytes(StandardCharsets.UTF_8),
                         RecordKind.PUT,
                         1L
                 ),
-                new InternalRecord(
+                InternalRecord.of(
                         ByteKey.copyOf("key2".getBytes(StandardCharsets.UTF_8)),
                         null,
                         RecordKind.DELETE,
@@ -90,7 +90,7 @@ class DefaultSSTableFlusherTest {
         for (int i = 0; i < 150; i++) {
             String keyStr = String.format("key-%04d", i);
             String valStr = String.format("value-payload-data-%04d", i);
-            records.add(new InternalRecord(
+            records.add(InternalRecord.of(
                     ByteKey.copyOf(keyStr.getBytes(StandardCharsets.UTF_8)),
                     valStr.getBytes(StandardCharsets.UTF_8),
                     RecordKind.PUT,
@@ -172,13 +172,13 @@ class DefaultSSTableFlusherTest {
     @DisplayName("Rejects unsorted records")
     void testRejectsUnsortedRecords() {
         List<InternalRecord> records = List.of(
-                new InternalRecord(
+                InternalRecord.of(
                         ByteKey.copyOf("z".getBytes(StandardCharsets.UTF_8)),
                         "1".getBytes(StandardCharsets.UTF_8),
                         RecordKind.PUT,
                         1L
                 ),
-                new InternalRecord(
+                InternalRecord.of(
                         ByteKey.copyOf("a".getBytes(StandardCharsets.UTF_8)),
                         "2".getBytes(StandardCharsets.UTF_8),
                         RecordKind.PUT,
@@ -210,7 +210,7 @@ class DefaultSSTableFlusherTest {
         DefaultSSTableFlusher faultFlusher = new DefaultSSTableFlusher(tempDir, faultStorage);
 
         List<InternalRecord> records = List.of(
-                new InternalRecord(
+                InternalRecord.of(
                         ByteKey.copyOf("key1".getBytes(StandardCharsets.UTF_8)),
                         "value1".getBytes(StandardCharsets.UTF_8),
                         RecordKind.PUT,
@@ -240,7 +240,7 @@ class DefaultSSTableFlusherTest {
         faultStorage.failOnFsync(true);
 
         List<InternalRecord> records = List.of(
-                new InternalRecord(
+                InternalRecord.of(
                         ByteKey.copyOf("key1".getBytes(StandardCharsets.UTF_8)),
                         "value1".getBytes(StandardCharsets.UTF_8),
                         RecordKind.PUT,

@@ -142,22 +142,17 @@ public final class DataBlockDecoder {
             bb.get(keyBytes);
             pos += keyLen;
 
-            byte[] valBytes = null;
-            RecordKind kind;
-
             if (flags == DataBlockEncoder.FLAG_PUT) {
-                kind = RecordKind.PUT;
-                valBytes = new byte[valLen];
+                byte[] valBytes = new byte[valLen];
                 bb.get(valBytes);
                 pos += valLen;
+                records.add(new InternalRecord.Put(ByteKey.copyOf(keyBytes), valBytes, sequence));
             } else if (flags == DataBlockEncoder.FLAG_DELETE) {
-                kind = RecordKind.DELETE;
+                records.add(new InternalRecord.Delete(ByteKey.copyOf(keyBytes), sequence));
             } else {
                 throw new StorageException(ErrorCode.CORRUPTION,
                         String.format("Unknown record flags 0x%02X at record index %d", flags, i));
             }
-
-            records.add(new InternalRecord(ByteKey.copyOf(keyBytes), valBytes, kind, sequence));
         }
 
         return records;

@@ -37,7 +37,7 @@ class DefaultDiskStorageReaderTest {
     }
 
     private static InternalRecord put(String key, String val, long seq) {
-        return new InternalRecord(
+        return InternalRecord.of(
                 ByteKey.copyOf(key.getBytes(StandardCharsets.UTF_8)),
                 val.getBytes(StandardCharsets.UTF_8),
                 RecordKind.PUT,
@@ -46,7 +46,7 @@ class DefaultDiskStorageReaderTest {
     }
 
     private static InternalRecord del(String key, long seq) {
-        return new InternalRecord(
+        return InternalRecord.of(
                 ByteKey.copyOf(key.getBytes(StandardCharsets.UTF_8)),
                 null,
                 RecordKind.DELETE,
