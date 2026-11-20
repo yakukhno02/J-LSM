@@ -66,12 +66,8 @@ public final class StandardStorageIO implements StorageIO {
         if (!Files.isDirectory(directory)) {
             return;
         }
-        // In POSIX, directory fsync ensures created or renamed entries are committed to disk.
-        // Some platforms or filesystems throw IOException when opening a directory with FileChannel.
         try (FileChannel dirChannel = FileChannel.open(directory, StandardOpenOption.READ)) {
             dirChannel.force(true);
-        } catch (IOException ignored) {
-            // Platform unsupported, gracefully ignored
         }
     }
 

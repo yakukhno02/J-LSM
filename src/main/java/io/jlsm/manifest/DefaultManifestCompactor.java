@@ -28,7 +28,9 @@ public final class DefaultManifestCompactor {
 
         try {
             storageIO.deleteIfExists(tmpPath);
-        } catch (IOException ignored) {}
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.IO, "Failed to delete temporary MANIFEST.tmp before compaction", e);
+        }
 
         ChannelIO tmpChannel;
         try {
@@ -48,7 +50,9 @@ public final class DefaultManifestCompactor {
         } catch (Exception e) {
             try {
                 storageIO.deleteIfExists(tmpPath);
-            } catch (IOException ignored) {}
+            } catch (IOException cleanupEx) {
+                e.addSuppressed(cleanupEx);
+            }
             if (e instanceof StorageException se) {
                 throw se;
             }
