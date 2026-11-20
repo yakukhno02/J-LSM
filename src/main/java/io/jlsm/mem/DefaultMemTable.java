@@ -6,6 +6,7 @@ import io.jlsm.internal.model.RecordCursor;
 
 import java.util.Iterator;
 import java.util.Objects;
+import java.util.ArrayList;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -74,7 +75,7 @@ public final class DefaultMemTable implements MemTable {
             view = map.subMap(fromKey, true, toKey, false);
         }
 
-        return new MemTableRecordCursor(view.values().iterator());
+        return new MemTableRecordCursor(new ArrayList<>(view.values()).iterator());
     }
 
     @Override

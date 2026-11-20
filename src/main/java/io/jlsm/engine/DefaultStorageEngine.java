@@ -392,6 +392,9 @@ public final class DefaultStorageEngine implements KVDatabase {
     }
 
     private void checkAndRotateMemTable() throws StorageException {
+        if (immutableMemTable != null) {
+            flushImmutableMemTable();
+        }
         if (activeMemTable.byteSize() >= options.memtableBytes() || memoryBudgetManager.isUnderMemoryPressure()) {
             rotateMemTable();
             flushImmutableMemTable();
@@ -453,12 +456,9 @@ public final class DefaultStorageEngine implements KVDatabase {
             activeWalId = newWalId;
             activeWalWriter = newWalWriter;
         } catch (StorageException e) {
-            backgroundError.compareAndSet(null, e);
             throw e;
         } catch (Exception e) {
-            StorageException se = new StorageException(ErrorCode.IO, "Failed to rotate memtable", e);
-            backgroundError.compareAndSet(null, se);
-            throw se;
+            throw new StorageException(ErrorCode.IO, "Failed to rotate memtable", e);
         } finally {
             stateLock.unlock();
         }
@@ -534,12 +534,9 @@ public final class DefaultStorageEngine implements KVDatabase {
                 scheduleCompaction();
             }
         } catch (StorageException e) {
-            backgroundError.compareAndSet(null, e);
             throw e;
         } catch (Exception e) {
-            StorageException se = new StorageException(ErrorCode.IO, "Failed to flush immutable memtable", e);
-            backgroundError.compareAndSet(null, se);
-            throw se;
+            throw new StorageException(ErrorCode.IO, "Failed to flush immutable memtable", e);
         } finally {
             stateLock.unlock();
         }
