@@ -78,9 +78,10 @@ flowchart TD
 | **I/O Abstraction** | `io.jlsm.internal.io` | **Dev 2** | `java.nio.channels` | Інтерфейси `StorageIO`, `ChannelIO`, `FaultInjectingStorage` |
 | **Shared Model** | `io.jlsm.internal.model` | **Спільно** | Немає | `ByteKey`, `InternalRecord`, `RecordKind`, `KeyRange` |
 | **MemTable** | `io.jlsm.mem` | **Dev 1** | `internal.model` | Швидка сортована пам'ять, snapshot копії для scan |
+| **WriteBatch** | `io.jlsm.api`, `engine` | **Dev 1** | `wal`, `mem` | Атомарний пакетний запис (all-or-nothing, Scope Extension) |
 | **WAL Engine** | `io.jlsm.wal` | **Dev 1** | `internal.io`, `model` | Серіалізація кадрів, перевірка CRC32, tail recovery |
 | **Manifest Store** | `io.jlsm.manifest` | **Dev 1** | `internal.io` | Журнал стану (Catalog), атомарний commit add/remove |
-| **SSTable Codecs** | `io.jlsm.sst` | **Dev 2** | `internal.io`, `model` | Блоки 4 КБ, `SparseIndex`, `Footer`, `TableHandle` |
+| **SSTable Codecs** | `io.jlsm.sst` | **Dev 2** | `internal.io`, `model` | Блоки 4 КБ, `SparseIndex`, `Footer`, `TableHandle`, `BloomFilter` (Scope Extension) |
 | **Merging Cursors** | `io.jlsm.merge` | **Dev 2** | `internal.model` | K-way merge курсор, дедуплікація за Sequence Number |
 | **Compactor** | `io.jlsm.compaction` | **Dev 2** | `sst`, `merge` | Чистий білдер злиття SSTables (без зміни маніфесту) |
 | **Engine & API** | `io.jlsm.engine`, `api` | **Dev 1** | Усі модулі | Оркестрація, блокування, фоновий воркер, публікація |
@@ -105,6 +106,9 @@ public interface KVDatabase extends AutoCloseable {
     void put(byte[] key, byte[] value) throws StorageException;  
     byte[] get(byte[] key) throws StorageException;  
     void delete(byte[] key) throws StorageException;  
+
+    // Атомарне застосування пакета операцій (all-or-nothing)
+    void write(WriteBatch batch) throws StorageException;
       
     // Діапазон [fromKey, toKey). null означає unbounded  
     ClosableIterator<Entry> scan(byte[] fromKey, byte[] toKey) throws StorageException;  
@@ -119,6 +123,19 @@ public interface KVDatabase extends AutoCloseable {
 
 ```java
 package io.jlsm.api;
+
+public interface WriteBatch extends AutoCloseable {
+    static WriteBatch create() {
+        return new io.jlsm.engine.DefaultWriteBatch();
+    }
+    WriteBatch put(byte[] key, byte[] value);
+    WriteBatch delete(byte[] key);
+    int operationCount();
+    long byteSize();
+    void clear();
+    @Override
+    void close();
+}
 
 public interface ClosableIterator<T> extends AutoCloseable {  
     boolean hasNext() throws StorageException;  
@@ -444,9 +461,14 @@ public interface Compactor {
 ```
 
 * CRC32: обчислюється над усіма наступними байтами кадру: від `Sequence` до кінця `Val`.  
-* Type: `0x01` для PUT, `0x02` для DELETE.  
+* Type: `0x01` для PUT, `0x02` для DELETE, `0x03` для BATCH (Scope Extension Dev 1).  
 * Для DELETE поле `ValLen` обов'язково дорівнює 0, байти `Val` відсутні.  
-* Максимальна сума `KeyLen + ValLen <= 4063` байтів.
+* Для кадру BATCH (0x03):
+  * `Sequence` (8B) — початковий sequence number батчу.
+  * `KeyLen` (4B) використовується як `OpCount` (кількість операцій у батчі).
+  * `ValLen` (4B) використовується як `PayloadLength` (сумарний розмір серіалізованих записів батчу).
+  * Вміст Payload: `[OpType: 1B (0x01/0x02) | KeyLen: 4B | ValLen: 4B | KeyBytes | ValBytes] * OpCount`.
+  * CRC32 обчислюється над усім кадром батчу. Пошкоджений хвіст логу усікається цілком (All-or-Nothing).
 
 ### 4.3 Формат SSTable
 
@@ -459,6 +481,8 @@ public interface Compactor {
 | Data Block 1 (Рівно 4096 байтів)                                              |  
 +-------------------------------------------------------------------------------+  
 | ...                                                                           |  
++-------------------------------------------------------------------------------+  
+| Bloom Filter Block (Змінна довжина: m = n * 10 бітів, Scope Extension Dev 2) |  
 +-------------------------------------------------------------------------------+  
 | Sparse Index Block (Змінна довжина)                                           |  
 +-------------------------------------------------------------------------------+  
@@ -563,7 +587,43 @@ sequenceDiagram
 5. **Оновлення пам'яті:** вставити `InternalRecord` у Active MemTable.  
 6. **Звільнення блокування:** `stateLock.unlock()`.
 
-### 5.2 Алгоритм get(key) (Dev 1 + Dev 2)
+### 5.2 Алгоритм write(WriteBatch) (Dev 1 — Scope Extension)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Клієнт
+    participant Engine as StorageEngine
+    participant Budget as MemoryBudgetManager
+    participant WAL as WalWriter
+    participant MT as Active MemTable
+
+    Client->>Engine: write(batch)
+    Engine->>Engine: Валідація (batch != null, opCount > 0)
+    Engine->>Budget: acquire(batch.byteSize())
+    Engine->>Engine: Захопити stateLock
+    Engine->>Engine: startSeq = highSequence + 1
+    Engine->>Engine: highSequence += batch.operationCount()
+    Engine->>WAL: appendBatch(startSeq, batch)
+    WAL->>WAL: Записати єдиний кадр 0x03 з розрахунком CRC32
+    opt durabilityMode == SYNC
+        WAL->>WAL: channel.force(false)
+    end
+    Engine->>MT: Послідовна вставка всіх записів батчу
+    Engine->>Engine: checkAndRotateMemTable()
+    Engine->>Engine: Відпустити stateLock
+    Engine-->>Client: void (Успіх)
+```
+
+1. **Валідація:** Перевірити `batch != null` та `batch.operationCount() > 0`.  
+2. **Резервування пам'яті:** Викликати `MemoryBudgetManager.acquire(batch.byteSize())`.  
+3. **Захоплення блокування:** `stateLock.lock()`, перевірити `ensureOpen()`.  
+4. **Виділення номерів послідовності:** Виділити безперервний діапазон `[startSeq, startSeq + count - 1]`.  
+5. **Запис у WAL:** Записати атомарний фрейм `BATCH (0x03)` у `activeWalWriter`. Якщо стається збій диска, WAL виконує `truncate` до позиції перед цим батчем.  
+6. **Оновлення MemTable:** Застосувати всі операції батчу до `activeMemTable`.  
+7. **Звільнення блокування:** `stateLock.unlock()`.
+
+### 5.3 Алгоритм get(key) (Dev 1 + Dev 2)
 
 ```mermaid
 flowchart TD
@@ -596,7 +656,7 @@ flowchart TD
 
 *Примітка щодо оптимізації:* оскільки покоління впорядковані в часі: Active MemTable (найновіша) → Immutable MemTable → SSTables (від найбільшого ID до найменшого). Якщо ключ знайдено в Active MemTable, дисковий пошук взагалі не викликається!
 
-### 5.3 Алгоритм scan(fromKey, toKey) (Dev 1 + Dev 2)
+### 5.4 Алгоритм scan(fromKey, toKey) (Dev 1 + Dev 2)
 
 1. **Захоплення Snapshot (Dev 1):**  
    * Під `stateLock` перевірити стан OPEN та ліміт `maxOpenScans`.  
@@ -615,7 +675,7 @@ flowchart TD
 3. **Закриття ітератора:**  
    * При виклику `iterator.close()` або досягненні EOF відпустити pins дискових таблиць (зменшити ref-counter) і видалити ітератор з реєстру.
 
-### 5.4 Алгоритм Flush (Dev 1 + Dev 2)
+### 5.5 Алгоритм Flush (Dev 1 + Dev 2)
 
 ```mermaid
 sequenceDiagram
@@ -648,7 +708,7 @@ sequenceDiagram
     Worker->>Worker: Відпустити stateLock
 ```
 
-### 5.5 Алгоритм фонового злиття Compaction (Dev 2 + Dev 1)
+### 5.6 Алгоритм фонового злиття Compaction (Dev 2 + Dev 1)
 
 1. **Тригер (Dev 1):** Після кожного успішного Flush перевіряється умова: `tables.size() >= options.compactionTrigger()`. Якщо умова істинна, задача Compaction ставиться у чергу воркера.  
 2. **Підготовка (Dev 1):** Під `stateLock` фіксується список усіх поточних `List<TableHandle>` таблиць. Резервується `outputFileId`.  
@@ -662,7 +722,7 @@ sequenceDiagram
    * Оновлюються посилання на відкриті таблиці в `StorageEngine`.  
    * Старі файли `.sst` позначаються як застарілі й фізично видаляються з диска, як тільки їхній ref-counter від відкритих scans стане рівним 0.
 
-### 5.6 Алгоритм аварійного відновлення Recovery (Dev 1)
+### 5.7 Алгоритм аварійного відновлення Recovery (Dev 1)
 
 При старті `KVDatabase.open()`:
 
@@ -728,8 +788,10 @@ gantt
     section Інтеграційні гейти
     M4 - Спільна інтеграція Flush (MemTable → SSTable)    :m4, after m3_1, 4d
     M5 - Інтеграція фонового Compactor та scan()           :m5, after m4, 4d
-    M6 - Fault Injection стрес-тести та краш-симуляція     :m6, after m5, 4d
-    M7 - Мутаційне тестування Pitest (>=80%) та фінал      :m7, after m6, 3d
+    M6 - Закриття проміжного аудиту (баги 1-7, state machine WAL) :m6, after m5, 4d
+    M7 - CLI демонстрація JLsmCli, REPL, бенчмарк та інспектор    :m7, after m6, 3d
+    M8 - Scope Extension (Write Batches для Dev 1, Bloom Filters для Dev 2) :m8, after m7, 4d
+    M9 - Фінальне мутаційне тестування Pitest (>=80%) та захист   :m9, after m8, 3d
 ```
 
 ### Етап 1: Віха M0 (Спільний старт — обов'язково для обох)
@@ -753,11 +815,17 @@ gantt
 * Підключення фонового воркера. Коли накопичується 4 файли SSTable, воркер викликає `Compactor` від Dev 2.  
 * Запуск диференційного тесту D-01: 100 000 випадкових операцій паралельно на J-LSM та `java.util.TreeMap`. Стан має бути 100% ідентичним.
 
-### Етап 5: Захист якості та мутаційне тестування (M6 — M7)
+### Етап 5: Закриття аудиту та інтерфейси (M6 — M7)
 
-* Запуск тесту на обмеження пам'яті: запис 500 МБ даних при прапорці JVM `-Xmx32m`. Тест не повинен завершуватися з `OutOfMemoryError`.  
-* Прогін мутаційного тестування **Pitest** (`mvn test-compile org.pitest:pitest-maven:mutationCoverage`).  
-* Ліквідація всіх мутантів на межах блоків (off-by-one), перевірках CRC32 та обробці прапорців видалення до досягнення показника **≥ 80%**.
+* **Віха M6:** Усунення зауважень проміжного аудиту (баги №1–№7). Єдина машина станів життєвого циклу WAL (`ACTIVE -> SEALED -> FLUSHED`), точний облік дельти пам'яті, відкат WAL при часткових помилках запису, введення `sealed interface InternalRecord`, очищення кастів `TableHandle`, додавання 8 перевірок гіпотез викладача та багатопотокового стрес-тесту.  
+* **Віха M7:** Створення інтерактивної демонстраційної утиліти `JLsmCli` з REPL, покроковим демо для захисту, бенчмарком та інспектором файлів.
+
+### Етап 6: Scope Extension та фінальний захист (M8 — M9)
+
+* **Віха M8 (Scope Extension — добір до ≥ 3 000 core LOC на людину):**
+  * **Dev 1:** Атомарні пакети запису `WriteBatch` (інтерфейс, бінарний кадр WAL 0x03 BATCH, все-або-нічого відновлення, тест стійкості R-03 та property-тест P-06).
+  * **Dev 2:** Фільтри Блума для SSTable (бітові масиви $m/n \approx 10$, хешування, інтеграція у точковий пошук `get()`, тест P-07).
+* **Віха M9:** Фінальний прогін мутаційного тестування **Pitest (≥ 80%)**, лінійне покриття **≥ 90%**, аудит обсягу коду ядра (разом ≥ 6 000 LOC на команду) та захист проєкту.
 
 ## 8. Definition of Done (Критерії готовності)
 
