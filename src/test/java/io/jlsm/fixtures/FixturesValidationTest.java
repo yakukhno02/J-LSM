@@ -22,6 +22,8 @@ class FixturesValidationTest {
     private static final int EXPECTED_SST_BLOCK0_CRC32 = 0x539D931A;
     private static final int EXPECTED_SST_INDEX_CRC32  = 0x50539E2F;
     private static final int EXPECTED_SST_FOOTER_CRC32 = 0xEEC0FA42;
+    private static final int EXPECTED_MANIFEST_HEADER_CRC32 = 0xE61550AD;
+    private static final int EXPECTED_MANIFEST_FRAME_CRC32  = 0x7A3EB215;
 
     @Test
     @DisplayName("Verify wal-minimal.bin layout, fields, and manually verified CRC32 values")
@@ -291,6 +293,72 @@ class FixturesValidationTest {
 
         assertThat(storedFooterCrc).isEqualTo(EXPECTED_SST_FOOTER_CRC32);
         assertThat(calculatedFooterCrc).isEqualTo(EXPECTED_SST_FOOTER_CRC32);
+        assertThat(buf.hasRemaining()).isFalse();
+    }
+
+    @Test
+    @DisplayName("Verify manifest-minimal.bin layout, fields, order (minSeq before maxSeq), and CRC32 values")
+    void testManifestMinimalFixture() throws IOException {
+        byte[] manifestBytes;
+        try (InputStream in = getClass().getResourceAsStream("/fixtures/manifest-minimal.bin")) {
+            assertThat(in).isNotNull();
+            manifestBytes = in.readAllBytes();
+        }
+
+        assertThat(manifestBytes).hasSize(105);
+        ByteBuffer buf = ByteBuffer.wrap(manifestBytes).order(ByteOrder.BIG_ENDIAN);
+
+        // 1. Header (16 bytes)
+        int magic = buf.getInt();
+        assertThat(magic).isEqualTo(0x4A4D414E); // "JMAN"
+        int version = buf.getInt();
+        assertThat(version).isEqualTo(1);
+        int reserved = buf.getInt();
+        assertThat(reserved).isEqualTo(0);
+
+        int storedHeaderCrc = buf.getInt();
+        CRC32 headerCrc = new CRC32();
+        headerCrc.update(manifestBytes, 0, 12);
+        assertThat(storedHeaderCrc).isEqualTo(EXPECTED_MANIFEST_HEADER_CRC32);
+        assertThat((int) headerCrc.getValue()).isEqualTo(EXPECTED_MANIFEST_HEADER_CRC32);
+
+        // 2. Snapshot frame
+        int payloadLen = buf.getInt();
+        assertThat(payloadLen).isEqualTo(81);
+
+        long epoch = buf.getLong();
+        assertThat(epoch).isEqualTo(1L);
+        long nextFileId = buf.getLong();
+        assertThat(nextFileId).isEqualTo(10L);
+        long highSequence = buf.getLong();
+        assertThat(highSequence).isEqualTo(100L);
+
+        int walCount = buf.getInt();
+        assertThat(walCount).isEqualTo(1);
+        int tableCount = buf.getInt();
+        assertThat(tableCount).isEqualTo(1);
+
+        long walId = buf.getLong();
+        assertThat(walId).isEqualTo(1L);
+        byte isSealed = buf.get();
+        assertThat(isSealed).isEqualTo((byte) 0x01);
+
+        long tableId = buf.getLong();
+        assertThat(tableId).isEqualTo(2L);
+        long minSeq = buf.getLong();
+        assertThat(minSeq).isEqualTo(1L);
+        long maxSeq = buf.getLong();
+        assertThat(maxSeq).isEqualTo(50L);
+        long recordCount = buf.getLong();
+        assertThat(recordCount).isEqualTo(10L);
+        long fileSize = buf.getLong();
+        assertThat(fileSize).isEqualTo(4096L);
+
+        int storedFrameCrc = buf.getInt();
+        CRC32 frameCrc = new CRC32();
+        frameCrc.update(manifestBytes, 16, 4 + 81);
+        assertThat(storedFrameCrc).isEqualTo(EXPECTED_MANIFEST_FRAME_CRC32);
+        assertThat((int) frameCrc.getValue()).isEqualTo(EXPECTED_MANIFEST_FRAME_CRC32);
         assertThat(buf.hasRemaining()).isFalse();
     }
 }
