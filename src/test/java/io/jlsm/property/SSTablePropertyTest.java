@@ -18,6 +18,7 @@ import io.jlsm.sst.TableHandle;
 import net.jqwik.api.Arbitraries;
 import net.jqwik.api.Arbitrary;
 import net.jqwik.api.Combinators;
+import net.jqwik.api.Example;
 import net.jqwik.api.ForAll;
 import net.jqwik.api.Property;
 import net.jqwik.api.Provide;
@@ -58,8 +59,8 @@ public class SSTablePropertyTest {
             for (RawOperation op : ops) {
                 ByteKey bk = ByteKey.copyOf(op.key());
                 InternalRecord rec = op.isDelete()
-                        ? new InternalRecord(bk, null, RecordKind.DELETE, seq++)
-                        : new InternalRecord(bk, op.value(), RecordKind.PUT, seq++);
+                        ? InternalRecord.of(bk, null, RecordKind.DELETE, seq++)
+                        : InternalRecord.of(bk, op.value(), RecordKind.PUT, seq++);
                 sorted.put(bk, rec);
             }
             return new ArrayList<>(sorted.values());
@@ -283,6 +284,91 @@ public class SSTablePropertyTest {
             } finally {
                 for (TableHandle h : handles) {
                     h.close();
+                }
+            }
+        } finally {
+            deleteDirectoryQuietly(tempDir);
+        }
+    }
+
+    @Example
+    public void regressionPrefixKeysOn4KbBlockBoundary() throws Exception {
+        Path tempDir = Files.createTempDirectory("jlsm-reg-prefix-");
+        try {
+            StandardStorageIO storageIO = new StandardStorageIO();
+            DefaultSSTableFlusher flusher = new DefaultSSTableFlusher(tempDir, storageIO);
+
+            List<InternalRecord> records = new ArrayList<>();
+            for (int i = 0; i < 150; i++) {
+                ByteKey bk = ByteKey.copyOf(String.format("boundary_test_prefix_%05d", i).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                byte[] val = String.format("value_for_boundary_testing_%05d", i).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                records.add(new InternalRecord.Put(bk, val, i + 1L));
+            }
+
+            TableMeta meta = flusher.build(101L, new ListCursor(records));
+            assertThat(meta.fileSize()).isGreaterThan(4096L);
+
+            Path sstPath = tempDir.resolve(String.format("%06d.sst", 101L));
+            try (DefaultTableHandle handle = DefaultTableHandle.open(storageIO, sstPath, meta)) {
+                for (int i = 0; i < 150; i++) {
+                    ByteKey bk = ByteKey.copyOf(String.format("boundary_test_prefix_%05d", i).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    Optional<InternalRecord> found = handle.get(bk);
+                    assertThat(found).isPresent();
+                    assertThat(found.get().sequence()).isEqualTo(i + 1L);
+                }
+
+                ByteKey from = ByteKey.copyOf("boundary_test_prefix_00030".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                ByteKey to = ByteKey.copyOf("boundary_test_prefix_00120".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                try (RecordCursor cursor = handle.scan(from, to)) {
+                    int count = 0;
+                    while (cursor.advance()) {
+                        count++;
+                    }
+                    assertThat(count).isEqualTo(90);
+                }
+            }
+        } finally {
+            deleteDirectoryQuietly(tempDir);
+        }
+    }
+
+    @Example
+    public void regressionHighBitRangeScans() throws Exception {
+        Path tempDir = Files.createTempDirectory("jlsm-reg-highbit-");
+        try {
+            StandardStorageIO storageIO = new StandardStorageIO();
+            DefaultSSTableFlusher flusher = new DefaultSSTableFlusher(tempDir, storageIO);
+
+            List<InternalRecord> records = new ArrayList<>();
+            byte[][] rawKeys = new byte[][] {
+                    new byte[]{0x01},
+                    new byte[]{0x7F},
+                    new byte[]{(byte) 0x80},
+                    new byte[]{(byte) 0xAA},
+                    new byte[]{(byte) 0xFE},
+                    new byte[]{(byte) 0xFF}
+            };
+
+            for (int i = 0; i < rawKeys.length; i++) {
+                records.add(new InternalRecord.Put(ByteKey.copyOf(rawKeys[i]), new byte[]{(byte) (i * 10)}, i + 1L));
+            }
+
+            TableMeta meta = flusher.build(202L, new ListCursor(records));
+            Path sstPath = tempDir.resolve(String.format("%06d.sst", 202L));
+            try (DefaultTableHandle handle = DefaultTableHandle.open(storageIO, sstPath, meta)) {
+                ByteKey from = ByteKey.copyOf(new byte[]{0x7F});
+                ByteKey to = ByteKey.copyOf(new byte[]{(byte) 0xFF});
+                try (RecordCursor cursor = handle.scan(from, to)) {
+                    List<ByteKey> scanned = new ArrayList<>();
+                    while (cursor.advance()) {
+                        scanned.add(cursor.current().key());
+                    }
+                    assertThat(scanned).containsExactly(
+                            ByteKey.copyOf(new byte[]{0x7F}),
+                            ByteKey.copyOf(new byte[]{(byte) 0x80}),
+                            ByteKey.copyOf(new byte[]{(byte) 0xAA}),
+                            ByteKey.copyOf(new byte[]{(byte) 0xFE})
+                    );
                 }
             }
         } finally {

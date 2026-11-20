@@ -34,7 +34,7 @@ class DifferentialOracleTest {
     void testD01DifferentialExecutionAgainstOracle(@TempDir Path tempDir) throws Exception {
         DatabaseOptions options = new DatabaseOptions(
                 DurabilityMode.BUFFERED,
-                64L * 1024, // 64 KB memtable for frequent flushes
+                32L * 1024, // 32 KB memtable for frequent flushes
                 4,          // Compaction trigger at 4 tables
                 8,
                 8L * 1024 * 1024,
@@ -46,19 +46,39 @@ class DifferentialOracleTest {
         Random random = new Random(42);
 
         int totalOperations = 100_000;
-        int keyPoolSize = 500; // Constrained key pool to ensure frequent overwrites and deletes
+        int keyPoolSize = 3_000; // Key pool significantly larger than memtable capacity
+
+        byte[][] keyPool = new byte[keyPoolSize][];
+        for (int i = 0; i < keyPoolSize; i++) {
+            if (i < 1000) {
+                keyPool[i] = String.format("key_%05d", i).getBytes(StandardCharsets.UTF_8);
+            } else if (i < 2000) {
+                // Prefix keys (hierarchical paths)
+                keyPool[i] = String.format("key_%05d/sub_%d", i % 1000, i % 5).getBytes(StandardCharsets.UTF_8);
+            } else {
+                // High-bit byte keys (0x80 to 0xFF)
+                byte[] hk = new byte[4];
+                hk[0] = (byte) (0x80 + (i % 120));
+                hk[1] = (byte) ((i >> 4) & 0xFF);
+                hk[2] = (byte) (i & 0xFF);
+                hk[3] = (byte) 0xAA;
+                keyPool[i] = hk;
+            }
+        }
 
         KVDatabase db = KVDatabase.open(tempDir, options);
         try {
             for (int op = 0; op < totalOperations; op++) {
                 int keyNum = random.nextInt(keyPoolSize);
-                byte[] key = String.format("key_%05d", keyNum).getBytes(StandardCharsets.UTF_8);
+                byte[] key = keyPool[keyNum];
 
                 int opType = random.nextInt(100);
 
                 if (opType < 45) {
-                    // 45% PUT
-                    byte[] value = String.format("val_%05d_%08d", keyNum, op).getBytes(StandardCharsets.UTF_8);
+                    // 45% PUT (including empty byte[0] values)
+                    byte[] value = (op % 10 == 0)
+                            ? new byte[0]
+                            : String.format("val_%05d_%08d", keyNum, op).getBytes(StandardCharsets.UTF_8);
                     db.put(key, value);
                     oracle.put(key, value);
                 } else if (opType < 65) {
@@ -73,15 +93,15 @@ class DifferentialOracleTest {
                     if (!Arrays.equals(dbVal, oracleVal)) {
                         assertThat(dbVal)
                                 .as("Mismatch at op %d for key %s: expected %s but got %s",
-                                        op, asString(key), asString(oracleVal), asString(dbVal))
+                                        op, Arrays.toString(key), Arrays.toString(oracleVal), Arrays.toString(dbVal))
                                 .isEqualTo(oracleVal);
                     }
                 } else {
                     // 2% Range Scan
                     int fromNum = random.nextInt(keyPoolSize);
-                    int toNum = fromNum + random.nextInt(20);
-                    byte[] fromKey = String.format("key_%05d", fromNum).getBytes(StandardCharsets.UTF_8);
-                    byte[] toKey = String.format("key_%05d", toNum).getBytes(StandardCharsets.UTF_8);
+                    int toNum = random.nextInt(keyPoolSize);
+                    byte[] fromKey = keyPool[Math.min(fromNum, toNum)];
+                    byte[] toKey = keyPool[Math.max(fromNum, toNum)];
 
                     List<Entry> oracleEntries = oracle.scan(fromKey, toKey);
                     List<Entry> dbEntries = new ArrayList<>();
@@ -98,24 +118,37 @@ class DifferentialOracleTest {
                     }
                 }
 
+                // Explicit flush and compaction cycles
+                if (op > 0 && op % 10_000 == 0) {
+                    DefaultStorageEngine engine = (DefaultStorageEngine) db;
+                    engine.rotateMemTable();
+                    engine.flushImmutableMemTable();
+                    engine.triggerCompactionSync();
+                    EngineInvariantValidator.validateAll(engine);
+                }
+
                 // Occasionally reopen the database to test crash recovery and state consistency
                 if (op > 0 && op % 25_000 == 0) {
                     db.close();
                     db = KVDatabase.open(tempDir, options);
                 }
             }
+            assertThat(db.metrics().flushCount()).isGreaterThan(0);
         } finally {
             db.close();
         }
 
         // Final full verification across all keys in the pool after reopen
         try (KVDatabase reopened = KVDatabase.open(tempDir, options)) {
+            assertThat(reopened.metrics().liveTablesCount()).isGreaterThan(0);
+            EngineInvariantValidator.validateAll((DefaultStorageEngine) reopened);
+
             for (int k = 0; k < keyPoolSize; k++) {
-                byte[] key = String.format("key_%05d", k).getBytes(StandardCharsets.UTF_8);
+                byte[] key = keyPool[k];
                 byte[] expected = oracle.get(key);
                 byte[] actual = reopened.get(key);
                 assertThat(actual)
-                        .as("Mismatch in final verification for key %s", asString(key))
+                        .as("Mismatch in final verification for key %s", Arrays.toString(key))
                         .isEqualTo(expected);
             }
 
