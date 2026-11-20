@@ -2,10 +2,12 @@ package io.jlsm.engine;
 
 import io.jlsm.api.ClosableIterator;
 import io.jlsm.api.DatabaseOptions;
+import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.internal.io.FaultInjectingStorage;
 import io.jlsm.wal.DefaultWalWriter;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -520,6 +522,139 @@ class DefaultStorageEngineTest {
             DefaultStorageEngine engine = (DefaultStorageEngine) db;
             assertThat(engine.liveTables()).isEmpty();
             assertThat(db.get(bytes("only_key"))).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("Repeated overwrites of the same key do not exhaust memory budget")
+    void testRepeatedOverwritesDoNotStallBudget(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                4096L, // 4KB budget
+                defaults.compactionTrigger(),
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            byte[] key = bytes("fixed_key");
+            byte[] value = bytes("fixed_value");
+            // 15,000 overwrites would exceed 4KB many times if delta wasn't accounted for
+            for (int i = 0; i < 15_000; i++) {
+                db.put(key, value);
+            }
+            assertThat(asString(db.get(key))).isEqualTo("fixed_value");
+        }
+    }
+
+    @Test
+    @DisplayName("WAL files replayed during recovery are deleted when memtable is flushed")
+    void testRecoveryWalDeletedAfterSubsequentFlush(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                DurabilityMode.SYNC,
+                1024L * 1024L,
+                defaults.compactionTrigger(),
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            db.put(bytes("k1"), bytes("v1"));
+            // no flush, leave WAL 1
+        }
+
+        Path wal1 = tempDir.resolve("000001.wal");
+        assertThat(Files.exists(wal1)).isTrue();
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+            assertThat(asString(db.get(bytes("k1")))).isEqualTo("v1");
+            db.put(bytes("k2"), bytes("v2"));
+
+            // Flush recovered data + new data
+            engine.rotateMemTable();
+            engine.flushImmutableMemTable();
+
+            // Replayed WAL 000001.wal should now be deleted from disk
+            assertThat(Files.exists(wal1)).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("Flush failure poisons engine and rejects subsequent operations")
+    void testFlushFailurePoisonsEngineAndRejectsWrites(@TempDir Path tempDir) throws Exception {
+        FaultInjectingStorage faultStorage = new FaultInjectingStorage();
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                DurabilityMode.SYNC,
+                256L,
+                defaults.compactionTrigger(),
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        RecoveryResult recoveryResult = new RecoveryManager(faultStorage, tempDir, options).recover();
+        DefaultStorageEngine engine = new DefaultStorageEngine(faultStorage, tempDir, options, recoveryResult);
+        try {
+            engine.put(bytes("k1"), bytes("v1"));
+            engine.rotateMemTable();
+
+            faultStorage.setDiskFull(true);
+
+            // Flush fails because disk is full
+            assertThatThrownBy(engine::flushImmutableMemTable)
+                    .isInstanceOf(StorageException.class);
+
+            // Engine is now poisoned; subsequent operations reject with CORRUPTION
+            assertThatThrownBy(() -> engine.put(bytes("k2"), bytes("v2")))
+                    .isInstanceOf(StorageException.class)
+                    .hasMessageContaining("poisoned");
+            assertThatThrownBy(() -> engine.get(bytes("k1")))
+                    .isInstanceOf(StorageException.class)
+                    .hasMessageContaining("poisoned");
+        } finally {
+            faultStorage.reset();
+            assertThatThrownBy(engine::close)
+                    .isInstanceOf(StorageException.class);
+        }
+    }
+
+    @Test
+    @DisplayName("Manifest compaction executes periodically without corrupting metadata")
+    void testPeriodicManifestCompaction(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                256L,
+                2,
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+            for (int i = 0; i < 60; i++) {
+                db.put(bytes("key" + i), bytes("value" + i));
+                engine.rotateMemTable();
+                engine.flushImmutableMemTable();
+            }
+        }
+
+        // Reopen to verify manifest is consistent after compactions
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            for (int i = 0; i < 60; i++) {
+                assertThat(asString(db.get(bytes("key" + i)))).isEqualTo("value" + i);
+            }
         }
     }
 }
