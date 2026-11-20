@@ -4,6 +4,7 @@ import io.jlsm.api.DatabaseOptions;
 import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.internal.io.StandardStorageIO;
+import io.jlsm.internal.io.FaultInjectingStorage;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -126,6 +127,58 @@ class CrashRecoveryKillTest {
                 t.printStackTrace();
                 System.exit(1);
             }
+        }
+    }
+
+    // ---- Grader hypothesis test (midterm feedback) ----
+
+    @Test
+    @DisplayName("Grader hypothesis: a crash after a rotation created the new WAL but before its MANIFEST frame was written still reopens")
+    void graderCrashBetweenWalCreationAndManifestCommitReopens(@TempDir Path tempDir) throws Exception {
+        String javaBin = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+        // Where the classes were loaded from, so the test works from any working directory.
+        String fullClasspath = classLocation(DefaultStorageEngine.class) + File.pathSeparator
+                + classLocation(RotationCrashWorker.class) + File.pathSeparator
+                + System.getProperty("java.class.path");
+        Process process = new ProcessBuilder(javaBin, "-cp", fullClasspath,
+                RotationCrashWorker.class.getName(), tempDir.toAbsolutePath().toString())
+                .redirectErrorStream(true).start();
+        String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertThat(process.waitFor()).as(output).isEqualTo(RotationCrashWorker.CRASH_EXIT_CODE);
+
+        try (KVDatabase db = KVDatabase.open(tempDir, RotationCrashWorker.OPTIONS)) {
+            assertThat(asString(db.get(bytes("a0")))).isEqualTo("x".repeat(50));
+        }
+    }
+
+    private static String classLocation(Class<?> type) throws Exception {
+        return Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI()).toString();
+    }
+
+    public static final class RotationCrashWorker {
+        static final int CRASH_EXIT_CODE = 9;
+        static final DatabaseOptions OPTIONS = DatabaseOptions.defaults()
+                .withDurabilityMode(DurabilityMode.BUFFERED)
+                .withMemtableBytes(2048);
+
+        public static void main(String[] args) throws Exception {
+            Path dir = Path.of(args[0]);
+            FaultInjectingStorage storage = new FaultInjectingStorage();
+            RecoveryResult recovered = new RecoveryManager(storage, dir, OPTIONS).recover();
+            DefaultStorageEngine db = new DefaultStorageEngine(storage, dir, OPTIONS, recovered);
+            int i = 0;
+            while (db.metrics().activeMemTableBytes() < OPTIONS.memtableBytes()) {
+                db.put(bytes("a" + (i++)), bytes("x".repeat(50)));
+            }
+            db.sync();
+            // The rotation writes the new WAL's 32-byte header; the MANIFEST frame after it is lost.
+            storage.failAfterBytesWritten(32);
+            try {
+                db.put(bytes("trigger"), bytes("t"));
+            } catch (Exception expected) {
+                // the process "dies" here, as with kill -9
+            }
+            Runtime.getRuntime().halt(CRASH_EXIT_CODE);
         }
     }
 }

@@ -27,7 +27,7 @@ public final class TreeMapOracle {
     public InternalRecord put(byte[] key, byte[] value) {
         Objects.requireNonNull(key, "key cannot be null");
         Objects.requireNonNull(value, "value cannot be null");
-        return apply(new InternalRecord(ByteKey.copyOf(key), value.clone(), RecordKind.PUT, ++nextSequence));
+        return apply(InternalRecord.of(ByteKey.copyOf(key), value.clone(), RecordKind.PUT, ++nextSequence));
     }
 
     /**
@@ -35,7 +35,7 @@ public final class TreeMapOracle {
      */
     public InternalRecord delete(byte[] key) {
         Objects.requireNonNull(key, "key cannot be null");
-        return apply(new InternalRecord(ByteKey.copyOf(key), null, RecordKind.DELETE, ++nextSequence));
+        return apply(InternalRecord.of(ByteKey.copyOf(key), null, RecordKind.DELETE, ++nextSequence));
     }
 
     /**

@@ -30,18 +30,7 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
                 continue;
             }
 
-            Optional<InternalRecord> candidate;
-            if (handle instanceof DefaultTableHandle defaultHandle) {
-                candidate = defaultHandle.get(key);
-            } else {
-                try (RecordCursor cursor = ((DefaultTableHandle) handle).scan(key, null)) {
-                    if (cursor.advance() && cursor.current().key().equals(key)) {
-                        candidate = Optional.of(cursor.current());
-                    } else {
-                        candidate = Optional.empty();
-                    }
-                }
-            }
+            Optional<InternalRecord> candidate = handle.get(key);
 
             if (candidate.isPresent()) {
                 InternalRecord record = candidate.get();
@@ -64,9 +53,7 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
 
         List<RecordCursor> cursors = new ArrayList<>(pinnedTables.size());
         for (TableHandle handle : pinnedTables) {
-            if (handle instanceof DefaultTableHandle defaultHandle) {
-                cursors.add(defaultHandle.scan(fromKey, toKey));
-            }
+            cursors.add(handle.scan(fromKey, toKey));
         }
 
         // In disk scan, tombstones are filtered out (retainTombstones = false)

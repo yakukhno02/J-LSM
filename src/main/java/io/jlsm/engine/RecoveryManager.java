@@ -46,6 +46,8 @@ public final class RecoveryManager {
         ManifestStore manifestStore = null;
 
         try {
+            StorageDiagnostics.cleanupOrphanFiles(storageIO, directory);
+
             manifestStore = openManifestStore();
             ManifestSnapshot snapshot = manifestStore.currentSnapshot();
 
@@ -57,6 +59,7 @@ public final class RecoveryManager {
             long nextFileId = activeWalId + 1;
             long nextEpoch = snapshot.epoch() + 1;
 
+            memTable.attachWalId(activeWalId);
             WalWriter activeWalWriter = createActiveWal(activeWalId);
 
             List<WalMeta> updatedWals = new ArrayList<>();
@@ -136,6 +139,7 @@ public final class RecoveryManager {
                 .toList();
 
         for (WalMeta wal : walsToReplay) {
+            memTable.attachWalId(wal.walId());
             Path walPath = directory.resolve(walFileName(wal.walId()));
             try {
                 ChannelIO channel = storageIO.openReadWrite(walPath);
@@ -162,6 +166,7 @@ public final class RecoveryManager {
 
     private WalWriter createActiveWal(long walId) throws StorageException, IOException {
         Path walPath = directory.resolve(walFileName(walId));
+        storageIO.deleteIfExists(walPath);
         ChannelIO channel = storageIO.createNew(walPath);
         return DefaultWalWriter.create(channel, walId, options.durabilityMode());
     }

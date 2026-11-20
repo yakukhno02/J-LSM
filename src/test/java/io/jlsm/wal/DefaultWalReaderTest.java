@@ -147,13 +147,14 @@ class DefaultWalReaderTest {
     }
 
     @Test
-    @DisplayName("Round-trip: WalWriter writes, WalReader reads identical records")
+    @DisplayName("Round-trip: WalWriter writes, WalReader reads identical records including full object and empty byte[] value")
     void testRoundTrip() throws Exception {
         InMemoryChannelIO writeChannel = new InMemoryChannelIO();
         try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 77L, DurabilityMode.BUFFERED)) {
             writer.append(100L, RecordKind.PUT, bytes("user:1"), bytes("Alice"));
             writer.append(101L, RecordKind.PUT, bytes("user:2"), bytes("Bob"));
             writer.append(102L, RecordKind.DELETE, bytes("user:1"), null);
+            writer.append(103L, RecordKind.PUT, bytes("user:empty"), new byte[0]);
         }
 
         InMemoryChannelIO readChannel = new InMemoryChannelIO(writeChannel.toByteArray());
@@ -167,11 +168,35 @@ class DefaultWalReaderTest {
                 }
             }
 
-            assertThat(records).hasSize(3);
-            assertThat(records.get(0).sequence()).isEqualTo(100L);
-            assertThat(records.get(1).sequence()).isEqualTo(101L);
-            assertThat(records.get(2).sequence()).isEqualTo(102L);
-            assertThat(records.get(2).isTombstone()).isTrue();
+            assertThat(records).hasSize(4);
+
+            InternalRecord r1 = records.get(0);
+            assertThat(r1.sequence()).isEqualTo(100L);
+            assertThat(r1.kind()).isEqualTo(RecordKind.PUT);
+            assertThat(r1.key()).isEqualTo(ByteKey.copyOf(bytes("user:1")));
+            assertThat(r1.value()).isEqualTo(bytes("Alice"));
+            assertThat(r1.isTombstone()).isFalse();
+
+            InternalRecord r2 = records.get(1);
+            assertThat(r2.sequence()).isEqualTo(101L);
+            assertThat(r2.kind()).isEqualTo(RecordKind.PUT);
+            assertThat(r2.key()).isEqualTo(ByteKey.copyOf(bytes("user:2")));
+            assertThat(r2.value()).isEqualTo(bytes("Bob"));
+            assertThat(r2.isTombstone()).isFalse();
+
+            InternalRecord r3 = records.get(2);
+            assertThat(r3.sequence()).isEqualTo(102L);
+            assertThat(r3.kind()).isEqualTo(RecordKind.DELETE);
+            assertThat(r3.key()).isEqualTo(ByteKey.copyOf(bytes("user:1")));
+            assertThat(r3.value()).isNull();
+            assertThat(r3.isTombstone()).isTrue();
+
+            InternalRecord r4 = records.get(3);
+            assertThat(r4.sequence()).isEqualTo(103L);
+            assertThat(r4.kind()).isEqualTo(RecordKind.PUT);
+            assertThat(r4.key()).isEqualTo(ByteKey.copyOf(bytes("user:empty")));
+            assertThat(r4.value()).isNotNull().isEmpty();
+            assertThat(r4.isTombstone()).isFalse();
         }
     }
 
@@ -300,5 +325,24 @@ class DefaultWalReaderTest {
         assertThatThrownBy(reader::recoverAndTruncateTail)
                 .isInstanceOf(StorageException.class)
                 .satisfies(e -> assertThat(((StorageException) e).code()).isEqualTo(ErrorCode.CLOSED));
+    }
+
+    // ---- Grader hypothesis test (midterm feedback) ----
+
+    @Test
+    @DisplayName("Grader hypothesis: an empty PUT value survives the WAL round trip as an empty value, not as null")
+    void graderEmptyValueSurvivesRoundTrip() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 1L, DurabilityMode.BUFFERED)) {
+            writer.append(1L, RecordKind.PUT, bytes("k"), new byte[0]);
+        }
+
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(writeChannel.toByteArray());
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH);
+             RecordCursor cursor = reader.openCursor()) {
+            assertThat(cursor.advance()).isTrue();
+            assertThat(cursor.current())
+                    .isEqualTo(InternalRecord.of(ByteKey.copyOf(bytes("k")), new byte[0], RecordKind.PUT, 1L));
+        }
     }
 }

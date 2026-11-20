@@ -2,10 +2,15 @@ package io.jlsm.engine;
 
 import io.jlsm.api.ClosableIterator;
 import io.jlsm.api.DatabaseOptions;
+import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.internal.io.FaultInjectingStorage;
+import io.jlsm.internal.io.StandardStorageIO;
+import java.time.Duration;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import io.jlsm.wal.DefaultWalWriter;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -520,6 +525,206 @@ class DefaultStorageEngineTest {
             DefaultStorageEngine engine = (DefaultStorageEngine) db;
             assertThat(engine.liveTables()).isEmpty();
             assertThat(db.get(bytes("only_key"))).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("Repeated overwrites of the same key do not exhaust memory budget")
+    void testRepeatedOverwritesDoNotStallBudget(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                4096L, // 4KB budget
+                defaults.compactionTrigger(),
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            byte[] key = bytes("fixed_key");
+            byte[] value = bytes("fixed_value");
+            // 15,000 overwrites would exceed 4KB many times if delta wasn't accounted for
+            for (int i = 0; i < 15_000; i++) {
+                db.put(key, value);
+            }
+            assertThat(asString(db.get(key))).isEqualTo("fixed_value");
+        }
+    }
+
+    @Test
+    @DisplayName("WAL files replayed during recovery are deleted when memtable is flushed")
+    void testRecoveryWalDeletedAfterSubsequentFlush(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                DurabilityMode.SYNC,
+                1024L * 1024L,
+                defaults.compactionTrigger(),
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            db.put(bytes("k1"), bytes("v1"));
+            // no flush, leave WAL 1
+        }
+
+        Path wal1 = tempDir.resolve("000001.wal");
+        assertThat(Files.exists(wal1)).isTrue();
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+            assertThat(asString(db.get(bytes("k1")))).isEqualTo("v1");
+            db.put(bytes("k2"), bytes("v2"));
+
+            // Flush recovered data + new data
+            engine.rotateMemTable();
+            engine.flushImmutableMemTable();
+
+            // Replayed WAL 000001.wal should now be deleted from disk
+            assertThat(Files.exists(wal1)).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("Manifest compaction executes periodically without corrupting metadata")
+    void testPeriodicManifestCompaction(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions defaults = DatabaseOptions.defaults();
+        DatabaseOptions options = new DatabaseOptions(
+                defaults.durabilityMode(),
+                256L,
+                2,
+                defaults.maxOpenScans(),
+                defaults.maxSnapshotBytes(),
+                defaults.maxIndexBytes(),
+                defaults.maxLiveTables()
+        );
+
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            DefaultStorageEngine engine = (DefaultStorageEngine) db;
+            for (int i = 0; i < 60; i++) {
+                db.put(bytes("key" + i), bytes("value" + i));
+                engine.rotateMemTable();
+                engine.flushImmutableMemTable();
+            }
+        }
+
+        // Reopen to verify manifest is consistent after compactions
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            for (int i = 0; i < 60; i++) {
+                assertThat(asString(db.get(bytes("key" + i)))).isEqualTo("value" + i);
+            }
+        }
+    }
+
+    // ---- Grader hypothesis tests (midterm feedback) ----
+
+    /** Opens the engine the way KVDatabase.open does, but typed, so tests reach the package-private hooks without a cast. */
+    private static DefaultStorageEngine openEngine(Path dir, DatabaseOptions options) throws Exception {
+        StandardStorageIO storage = new StandardStorageIO();
+        RecoveryResult recovered = new RecoveryManager(storage, dir, options).recover();
+        return new DefaultStorageEngine(storage, dir, options, recovered);
+    }
+
+    @Test
+    @DisplayName("Grader hypothesis: a value overwritten and flushed after a reopen stays overwritten after the next reopen")
+    void graderOverwriteSurvivesSecondReopen(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions options = DatabaseOptions.defaults();
+        try (DefaultStorageEngine db = openEngine(tempDir, options)) {
+            db.put(bytes("k"), bytes("v1"));
+        }
+        try (DefaultStorageEngine db = openEngine(tempDir, options)) {
+            db.put(bytes("k"), bytes("v2"));
+            db.rotateMemTable();
+            db.flushImmutableMemTable();
+            assertThat(asString(db.get(bytes("k")))).isEqualTo("v2");
+        }
+        try (DefaultStorageEngine db = openEngine(tempDir, options)) {
+            assertThat(asString(db.get(bytes("k")))).isEqualTo("v2");
+        }
+    }
+
+    @Test
+    @DisplayName("Grader hypothesis: a key deleted and flushed after a reopen stays deleted after the next reopen")
+    void graderDeleteSurvivesSecondReopen(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions options = DatabaseOptions.defaults();
+        try (DefaultStorageEngine db = openEngine(tempDir, options)) {
+            db.put(bytes("k"), bytes("v1"));
+        }
+        try (DefaultStorageEngine db = openEngine(tempDir, options)) {
+            db.delete(bytes("k"));
+            db.rotateMemTable();
+            db.flushImmutableMemTable();
+            assertThat(db.get(bytes("k"))).isNull();
+        }
+        try (DefaultStorageEngine db = openEngine(tempDir, options)) {
+            assertThat(db.get(bytes("k"))).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("Grader hypothesis: overwriting one key 20,000 times does not block put()")
+    void graderRepeatedOverwritesDoNotBlock(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions options = DatabaseOptions.defaults().withDurabilityMode(DurabilityMode.BUFFERED);
+        byte[] value = new byte[1000];
+        try (KVDatabase db = KVDatabase.open(tempDir, options)) {
+            assertTimeoutPreemptively(Duration.ofSeconds(20), () -> {
+                for (int i = 0; i < 20_000; i++) {
+                    db.put(bytes("counter"), value);
+                }
+            });
+            assertThat(db.get(bytes("counter"))).isEqualTo(value);
+        }
+    }
+
+    @Test
+    @DisplayName("Grader hypothesis: after one failed flush, later puts complete once the disk works again")
+    void graderPutsContinueAfterFailedFlush(@TempDir Path tempDir) throws Exception {
+        DatabaseOptions options = DatabaseOptions.defaults()
+                .withDurabilityMode(DurabilityMode.BUFFERED)
+                .withMemtableBytes(2048);
+        FaultInjectingStorage storage = new FaultInjectingStorage();
+        RecoveryResult recovered = new RecoveryManager(storage, tempDir, options).recover();
+        try (DefaultStorageEngine db = new DefaultStorageEngine(storage, tempDir, options, recovered)) {
+            int i = 0;
+            while (db.metrics().activeMemTableBytes() < options.memtableBytes()) {
+                db.put(bytes("a" + (i++)), bytes("x".repeat(50)));
+            }
+            // The rotation (new WAL header + one MANIFEST frame) fits in 300 bytes; the SSTable does not.
+            storage.failAfterBytesWritten(300);
+            assertThatThrownBy(() -> db.put(bytes("trigger"), bytes("t")))
+                    .isInstanceOf(StorageException.class);
+            storage.reset();
+
+            assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
+                for (int k = 0; k < 200; k++) {
+                    db.put(bytes("b" + k), bytes("y".repeat(50)));
+                }
+            });
+            assertThat(asString(db.get(bytes("a0")))).isEqualTo("x".repeat(50));
+            assertThat(asString(db.get(bytes("b199")))).isEqualTo("y".repeat(50));
+        }
+    }
+
+    @Test
+    @DisplayName("Grader hypothesis: an open scan does not see a key written after the scan was opened")
+    void graderScanIsIsolatedFromLaterWrites(@TempDir Path tempDir) throws Exception {
+        try (KVDatabase db = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            for (String k : List.of("a", "b", "c", "d", "e")) {
+                db.put(bytes(k), bytes("1"));
+            }
+            List<String> keys = new ArrayList<>();
+            try (ClosableIterator<Entry> it = db.scan(null, null)) {
+                keys.add(asString(it.next().key()));
+                db.put(bytes("z"), bytes("2"));
+                while (it.hasNext()) {
+                    keys.add(asString(it.next().key()));
+                }
+            }
+            assertThat(keys).containsExactly("a", "b", "c", "d", "e");
         }
     }
 }

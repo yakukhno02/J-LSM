@@ -30,11 +30,11 @@ class DefaultMemTableTest {
     }
 
     private static InternalRecord putRecord(String k, String v, long seq) {
-        return new InternalRecord(key(k), bytes(v), RecordKind.PUT, seq);
+        return InternalRecord.of(key(k), bytes(v), RecordKind.PUT, seq);
     }
 
     private static InternalRecord deleteRecord(String k, long seq) {
-        return new InternalRecord(key(k), null, RecordKind.DELETE, seq);
+        return InternalRecord.of(key(k), null, RecordKind.DELETE, seq);
     }
 
     @Test
@@ -76,21 +76,24 @@ class DefaultMemTableTest {
         DefaultMemTable memTable = new DefaultMemTable();
         ByteKey k = key("key1"); // length = 4
         byte[] v1 = bytes("value1"); // length = 6
-        InternalRecord rec1 = new InternalRecord(k, v1, RecordKind.PUT, 1L);
+        InternalRecord rec1 = InternalRecord.of(k, v1, RecordKind.PUT, 1L);
 
         // overhead(32) + key(4) + val(6) = 42
-        memTable.insert(k, rec1);
+        long delta1 = memTable.insert(k, rec1);
+        assertThat(delta1).isEqualTo(42L);
         assertThat(memTable.byteSize()).isEqualTo(42L);
 
         // Update with longer value: overhead(32) + key(4) + val(11) = 47
         byte[] v2 = bytes("valueLonger"); // length = 11
-        InternalRecord rec2 = new InternalRecord(k, v2, RecordKind.PUT, 2L);
-        memTable.insert(k, rec2);
+        InternalRecord rec2 = InternalRecord.of(k, v2, RecordKind.PUT, 2L);
+        long delta2 = memTable.insert(k, rec2);
+        assertThat(delta2).isEqualTo(5L);
         assertThat(memTable.byteSize()).isEqualTo(32L + 4L + 11L);
 
         // Update with tombstone (null value): overhead(32) + key(4) + val(0) = 36
         InternalRecord tombstone = deleteRecord("key1", 3L);
-        memTable.insert(k, tombstone);
+        long delta3 = memTable.insert(k, tombstone);
+        assertThat(delta3).isEqualTo(-11L);
         assertThat(memTable.byteSize()).isEqualTo(36L);
 
         // Clear resets everything

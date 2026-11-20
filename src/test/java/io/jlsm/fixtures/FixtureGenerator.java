@@ -13,6 +13,7 @@ public final class FixtureGenerator {
     public static final int WAL_MAGIC = 0x4A57414C; // "JWAL"
     public static final int SST_MAGIC = 0x4A535354; // "JSST"
     public static final int FOOTER_MAGIC = 0x4A4C534D; // "JLSM"
+    public static final int MANIFEST_MAGIC = 0x4A4D414E; // "JMAN"
     public static final int FORMAT_VERSION = 1;
 
     public static byte[] generateMinimalWal(long fileId) {
@@ -168,9 +169,50 @@ public final class FixtureGenerator {
         return sstBuf.array();
     }
 
+    public static byte[] generateMinimalManifest() {
+        ByteBuffer headerBuf = ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN);
+        headerBuf.putInt(MANIFEST_MAGIC);
+        headerBuf.putInt(FORMAT_VERSION);
+        headerBuf.putInt(0); // Reserved = 0
+
+        CRC32 headerCrc = new CRC32();
+        headerCrc.update(headerBuf.array(), 0, 12);
+        int headerCrcValue = (int) headerCrc.getValue();
+        headerBuf.putInt(headerCrcValue);
+
+        ByteBuffer payloadBuf = ByteBuffer.allocate(81).order(ByteOrder.BIG_ENDIAN);
+        payloadBuf.putLong(1L); // epoch
+        payloadBuf.putLong(10L); // nextFileId
+        payloadBuf.putLong(100L); // highSequence
+        payloadBuf.putInt(1); // walCount
+        payloadBuf.putInt(1); // tableCount
+        payloadBuf.putLong(1L); // walId
+        payloadBuf.put((byte) 0x01); // isSealed = true
+        payloadBuf.putLong(2L); // tableId
+        payloadBuf.putLong(1L); // minSeq
+        payloadBuf.putLong(50L); // maxSeq
+        payloadBuf.putLong(10L); // recordCount
+        payloadBuf.putLong(4096L); // fileSize
+
+        ByteBuffer frameBuf = ByteBuffer.allocate(4 + 81 + 4).order(ByteOrder.BIG_ENDIAN);
+        frameBuf.putInt(81);
+        frameBuf.put(payloadBuf.array());
+
+        CRC32 frameCrc = new CRC32();
+        frameCrc.update(frameBuf.array(), 0, 85);
+        int frameCrcValue = (int) frameCrc.getValue();
+        frameBuf.putInt(frameCrcValue);
+
+        ByteBuffer manifestBuf = ByteBuffer.allocate(16 + 89).order(ByteOrder.BIG_ENDIAN);
+        manifestBuf.put(headerBuf.array());
+        manifestBuf.put(frameBuf.array());
+        return manifestBuf.array();
+    }
+
     public static void writeFixturesTo(Path targetDir) throws IOException {
         Files.createDirectories(targetDir);
         Files.write(targetDir.resolve("wal-minimal.bin"), generateMinimalWal(1L));
         Files.write(targetDir.resolve("sstable-minimal.bin"), generateMinimalSSTable(1L));
+        Files.write(targetDir.resolve("manifest-minimal.bin"), generateMinimalManifest());
     }
 }

@@ -221,13 +221,16 @@ public final class DefaultWalReader implements WalReader {
         byte[] key = new byte[keyLen];
         payloadBuf.get(key);
 
-        byte[] val = null;
-        if (kind == RecordKind.PUT && valLen > 0) {
-            val = new byte[valLen];
-            payloadBuf.get(val);
+        InternalRecord record;
+        if (kind == RecordKind.PUT) {
+            byte[] val = new byte[valLen];
+            if (valLen > 0) {
+                payloadBuf.get(val);
+            }
+            record = new InternalRecord.Put(ByteKey.copyOf(key), val, seq);
+        } else {
+            record = new InternalRecord.Delete(ByteKey.copyOf(key), seq);
         }
-
-        InternalRecord record = new InternalRecord(ByteKey.copyOf(key), val, kind, seq);
         return new ParsedFrame(record, totalFrameLen);
     }
 

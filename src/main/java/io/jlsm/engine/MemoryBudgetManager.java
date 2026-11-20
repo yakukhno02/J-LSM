@@ -53,14 +53,11 @@ public final class MemoryBudgetManager {
         return Math.max(1024L * 1024, configured);
     }
 
-    public void acquire(long bytes) throws StorageException {
-        if (bytes <= 0 || closed) {
+    public void checkBackpressure() throws StorageException {
+        if (closed) {
             return;
         }
-
-        long current = allocatedBytes.addAndGet(bytes);
-
-        if (current >= highWatermarkBytes) {
+        if (allocatedBytes.get() >= highWatermarkBytes) {
             long startNanos = System.nanoTime();
             lock.lock();
             try {
@@ -78,6 +75,22 @@ public final class MemoryBudgetManager {
                 lock.unlock();
             }
         }
+    }
+
+    public void update(long deltaBytes) {
+        if (deltaBytes > 0) {
+            allocatedBytes.addAndGet(deltaBytes);
+        } else if (deltaBytes < 0) {
+            release(-deltaBytes);
+        }
+    }
+
+    public void acquire(long bytes) throws StorageException {
+        if (bytes <= 0 || closed) {
+            return;
+        }
+        allocatedBytes.addAndGet(bytes);
+        checkBackpressure();
     }
 
     public void release(long bytes) {

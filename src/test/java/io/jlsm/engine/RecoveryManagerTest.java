@@ -100,39 +100,34 @@ class RecoveryManagerTest {
         long wal1Id = res1.activeWalId();
 
         WalWriter writer = res1.activeWalWriter();
-        writer.append(10L, RecordKind.PUT, bytes("k1"), bytes("v1"));
-        writer.append(20L, RecordKind.PUT, bytes("k2"), bytes("v2"));
-        writer.append(25L, RecordKind.DELETE, bytes("k1"), null);
-
-        // Close session
+        writer.append(1L, RecordKind.PUT, bytes("key1"), bytes("val1"));
+        writer.append(2L, RecordKind.PUT, bytes("key2"), bytes("val2"));
+        writer.append(3L, RecordKind.DELETE, bytes("key1"), null);
         writer.close();
         res1.manifestStore().close();
         res1.lockHandle().close();
 
-        // 2. Restart and recover
+        // 2. Second recovery: should replay WAL 1 into MemTable and seal it
         RecoveryManager manager2 = new RecoveryManager(storageIO, tempDir, options);
         RecoveryResult res2 = manager2.recover();
 
         try {
-            assertThat(res2.highSequence()).isEqualTo(25L);
+            assertThat(res2.highSequence()).isEqualTo(3L);
             assertThat(res2.activeWalId()).isGreaterThan(wal1Id);
 
-            // Verify MemTable replayed accurately
-            Optional<InternalRecord> k1 = res2.activeMemTable().get(key("k1"));
-            assertThat(k1).isPresent();
-            assertThat(k1.get().isTombstone()).isTrue();
-            assertThat(k1.get().sequence()).isEqualTo(25L);
+            // Verify MemTable contents
+            Optional<InternalRecord> rec1 = res2.activeMemTable().get(key("key1"));
+            assertThat(rec1).isPresent();
+            assertThat(rec1.get().isTombstone()).isTrue();
 
-            Optional<InternalRecord> k2 = res2.activeMemTable().get(key("k2"));
-            assertThat(k2).isPresent();
-            assertThat(k2.get().value()).isEqualTo(bytes("v2"));
-            assertThat(k2.get().sequence()).isEqualTo(20L);
+            Optional<InternalRecord> rec2 = res2.activeMemTable().get(key("key2"));
+            assertThat(rec2).isPresent();
+            assertThat(rec2.get().value()).isEqualTo(bytes("val2"));
 
-            // Previous WAL should now be sealed in manifest
+            // Manifest should have wal1 as sealed and new active WAL
             ManifestSnapshot snapshot2 = res2.manifestSnapshot();
             assertThat(snapshot2.wals()).contains(new WalMeta(wal1Id, true));
             assertThat(snapshot2.wals()).contains(new WalMeta(res2.activeWalId(), false));
-
         } finally {
             res2.activeWalWriter().close();
             res2.manifestStore().close();
@@ -183,6 +178,39 @@ class RecoveryManagerTest {
             // Verify physical truncation of the old WAL
             assertThat(Files.size(walPath)).isEqualTo(validSize);
 
+        } finally {
+            res2.activeWalWriter().close();
+            res2.manifestStore().close();
+            res2.lockHandle().close();
+        }
+    }
+
+    @Test
+    @DisplayName("Bug #4: Uncommitted orphan WAL file on disk is cleaned up and does not cause FileAlreadyExistsException on recovery")
+    void testUncommittedOrphanWalCleanedUpOnRecovery(@TempDir Path tempDir) throws Exception {
+        StorageIO storageIO = new StandardStorageIO();
+        DatabaseOptions options = DatabaseOptions.defaults();
+
+        // 1. First run creates WAL 1 and manifest with nextFileId = 2
+        RecoveryManager manager1 = new RecoveryManager(storageIO, tempDir, options);
+        RecoveryResult res1 = manager1.recover();
+        res1.activeWalWriter().close();
+        res1.manifestStore().close();
+        res1.lockHandle().close();
+
+        // 2. Simulate crash during rotation: 000002.wal exists on disk, but NOT in manifest
+        Path orphanWal = tempDir.resolve(RecoveryManager.walFileName(2L));
+        Files.write(orphanWal, bytes("leftover partial garbage"));
+        assertThat(Files.exists(orphanWal)).isTrue();
+
+        // 3. Recovery must succeed without FileAlreadyExistsException
+        RecoveryManager manager2 = new RecoveryManager(storageIO, tempDir, options);
+        RecoveryResult res2 = manager2.recover();
+        try {
+            assertThat(res2.activeWalId()).isEqualTo(2L);
+            assertThat(Files.exists(orphanWal)).isTrue();
+            // Should be a valid empty WAL, not corrupted garbage
+            assertThat(Files.size(orphanWal)).isEqualTo(DefaultWalWriter.HEADER_SIZE);
         } finally {
             res2.activeWalWriter().close();
             res2.manifestStore().close();

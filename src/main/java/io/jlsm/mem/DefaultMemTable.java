@@ -6,7 +6,10 @@ import io.jlsm.internal.model.RecordCursor;
 
 import java.util.Iterator;
 import java.util.Objects;
+import java.util.ArrayList;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -22,26 +25,31 @@ public final class DefaultMemTable implements MemTable {
 
     private final ConcurrentSkipListMap<ByteKey, InternalRecord> map;
     private final AtomicLong byteSize;
+    private final Set<Long> attachedWalIds;
 
     public DefaultMemTable() {
         this.map = new ConcurrentSkipListMap<>();
         this.byteSize = new AtomicLong(0L);
+        this.attachedWalIds = ConcurrentHashMap.newKeySet();
     }
 
     @Override
-    public void insert(ByteKey key, InternalRecord record) {
+    public long insert(ByteKey key, InternalRecord record) {
         Objects.requireNonNull(key, "key cannot be null");
         Objects.requireNonNull(record, "record cannot be null");
 
         long recordBytes = calculateRecordBytes(key, record);
         InternalRecord oldRecord = map.put(key, record);
 
+        long deltaBytes;
         if (oldRecord != null) {
             long oldBytes = calculateRecordBytes(key, oldRecord);
-            byteSize.addAndGet(recordBytes - oldBytes);
+            deltaBytes = recordBytes - oldBytes;
         } else {
-            byteSize.addAndGet(recordBytes);
+            deltaBytes = recordBytes;
         }
+        byteSize.addAndGet(deltaBytes);
+        return deltaBytes;
     }
 
     @Override
@@ -67,7 +75,7 @@ public final class DefaultMemTable implements MemTable {
             view = map.subMap(fromKey, true, toKey, false);
         }
 
-        return new MemTableRecordCursor(view.values().iterator());
+        return new MemTableRecordCursor(new ArrayList<>(view.values()).iterator());
     }
 
     @Override
@@ -84,6 +92,17 @@ public final class DefaultMemTable implements MemTable {
     public void clear() {
         map.clear();
         byteSize.set(0L);
+        attachedWalIds.clear();
+    }
+
+    @Override
+    public void attachWalId(long walId) {
+        attachedWalIds.add(walId);
+    }
+
+    @Override
+    public Set<Long> attachedWalIds() {
+        return Set.copyOf(attachedWalIds);
     }
 
     private static long calculateRecordBytes(ByteKey key, InternalRecord record) {

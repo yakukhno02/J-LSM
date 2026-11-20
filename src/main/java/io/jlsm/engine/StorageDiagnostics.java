@@ -170,11 +170,11 @@ public final class StorageDiagnostics {
     public static void printReport(IntegrityReport report, PrintStream out) {
         Objects.requireNonNull(report, "report cannot be null");
         Objects.requireNonNull(out, "out cannot be null");
-        out.println("================================================================================");
+        out.println("=================================================================================");
         out.println("                         J-LSM STORAGE DIAGNOSTICS REPORT                       ");
-        out.println("================================================================================");
+        out.println("=================================================================================");
         out.println(report.toFormattedSummary());
-        out.println("================================================================================");
+        out.println("=================================================================================");
     }
 
     public static int cleanupOrphanFiles(Path directory) throws StorageException {
@@ -213,10 +213,8 @@ public final class StorageDiagnostics {
             for (Path entry : stream) {
                 String fileName = entry.getFileName().toString();
                 if (fileName.endsWith(".tmp")) {
-                    try {
-                        storageIO.deleteIfExists(entry);
-                        deletedCount++;
-                    } catch (IOException ignored) {}
+                    storageIO.deleteIfExists(entry);
+                    deletedCount++;
                     continue;
                 }
 
@@ -224,10 +222,8 @@ public final class StorageDiagnostics {
                 if (sstMatcher.matches()) {
                     long id = Long.parseLong(sstMatcher.group(1));
                     if (!liveTableIds.contains(id)) {
-                        try {
-                            storageIO.deleteIfExists(entry);
-                            deletedCount++;
-                        } catch (IOException ignored) {}
+                        storageIO.deleteIfExists(entry);
+                        deletedCount++;
                     }
                     continue;
                 }
@@ -236,10 +232,8 @@ public final class StorageDiagnostics {
                 if (walMatcher.matches()) {
                     long id = Long.parseLong(walMatcher.group(1));
                     if (!liveWalIds.contains(id)) {
-                        try {
-                            storageIO.deleteIfExists(entry);
-                            deletedCount++;
-                        } catch (IOException ignored) {}
+                        storageIO.deleteIfExists(entry);
+                        deletedCount++;
                     }
                 }
             }
