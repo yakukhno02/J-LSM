@@ -107,8 +107,7 @@ class FaultInjectionMatrixTest {
                     .isInstanceOf(StorageException.class);
         } finally {
             faultStorage.reset();
-            assertThatThrownBy(engine::close)
-                    .isInstanceOf(StorageException.class);
+            engine.close();
         }
 
         // Clean recovery
@@ -145,8 +144,7 @@ class FaultInjectionMatrixTest {
                     .isInstanceOf(StorageException.class);
         } finally {
             faultStorage.reset();
-            assertThatThrownBy(engine::close)
-                    .isInstanceOf(StorageException.class);
+            engine.close();
         }
 
         try (KVDatabase reopened = KVDatabase.open(testDir, options)) {

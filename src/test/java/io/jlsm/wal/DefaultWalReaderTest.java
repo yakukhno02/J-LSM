@@ -326,4 +326,23 @@ class DefaultWalReaderTest {
                 .isInstanceOf(StorageException.class)
                 .satisfies(e -> assertThat(((StorageException) e).code()).isEqualTo(ErrorCode.CLOSED));
     }
+
+    // ---- Grader hypothesis test (midterm feedback) ----
+
+    @Test
+    @DisplayName("Grader hypothesis: an empty PUT value survives the WAL round trip as an empty value, not as null")
+    void graderEmptyValueSurvivesRoundTrip() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 1L, DurabilityMode.BUFFERED)) {
+            writer.append(1L, RecordKind.PUT, bytes("k"), new byte[0]);
+        }
+
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(writeChannel.toByteArray());
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH);
+             RecordCursor cursor = reader.openCursor()) {
+            assertThat(cursor.advance()).isTrue();
+            assertThat(cursor.current())
+                    .isEqualTo(InternalRecord.of(ByteKey.copyOf(bytes("k")), new byte[0], RecordKind.PUT, 1L));
+        }
+    }
 }

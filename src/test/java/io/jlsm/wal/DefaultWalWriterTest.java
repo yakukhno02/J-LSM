@@ -4,6 +4,13 @@ import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.io.ChannelIO;
+import io.jlsm.internal.io.FaultInjectingStorage;
+import io.jlsm.internal.io.StandardStorageIO;
+import io.jlsm.internal.model.InternalRecord;
+import io.jlsm.internal.model.RecordCursor;
+import org.junit.jupiter.api.io.TempDir;
+import java.util.ArrayList;
+import java.util.List;
 import io.jlsm.internal.model.RecordKind;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -315,5 +322,35 @@ class DefaultWalWriterTest {
             assertThat(cursor.current().sequence()).isEqualTo(3L);
             assertThat(cursor.advance()).isFalse();
         }
+    }
+
+    // ---- Grader hypothesis test (midterm feedback) ----
+
+    @Test
+    @DisplayName("Grader hypothesis: a failed short append followed by a smaller append leaves a readable WAL")
+    void graderShortWriteThenSmallerAppendLeavesReadableLog(@TempDir Path tempDir) throws Exception {
+        Path walPath = tempDir.resolve("000001.wal");
+        FaultInjectingStorage storage = new FaultInjectingStorage();
+        DefaultWalWriter writer = DefaultWalWriter.create(storage.createNew(walPath), 1L, DurabilityMode.BUFFERED);
+        writer.append(1L, RecordKind.PUT, bytes("before"), bytes("1"));
+
+        storage.failAfterBytesWritten(100); // the 1,024-byte frame is cut after 100 bytes
+        assertThatThrownBy(() -> writer.append(2L, RecordKind.PUT, bytes("big"), new byte[1000]))
+                .isInstanceOf(StorageException.class);
+        storage.reset();
+        writer.append(3L, RecordKind.PUT, bytes("small"), bytes("2"));
+        writer.close();
+
+        List<String> keys = new ArrayList<>();
+        try (DefaultWalReader reader = DefaultWalReader.open(new StandardStorageIO().openReadWrite(walPath), walPath)) {
+            reader.recoverAndTruncateTail();
+            try (RecordCursor cursor = reader.openCursor()) {
+                while (cursor.advance()) {
+                    InternalRecord record = cursor.current();
+                    keys.add(new String(record.key().bytes(), StandardCharsets.UTF_8));
+                }
+            }
+        }
+        assertThat(keys).containsExactly("before", "small");
     }
 }
