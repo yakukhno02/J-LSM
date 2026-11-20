@@ -130,6 +130,12 @@ public final class DefaultWalWriter implements WalWriter {
                 channel.force(false);
             }
         } catch (IOException e) {
+            try {
+                channel.truncate(offsetWritten);
+            } catch (IOException truncateEx) {
+                e.addSuppressed(truncateEx);
+            }
+            writeOffset = offsetWritten;
             throw new StorageException(ErrorCode.IO, "Failed to append record at sequence: " + sequence, e);
         }
 

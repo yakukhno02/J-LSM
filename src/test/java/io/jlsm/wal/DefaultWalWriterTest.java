@@ -9,6 +9,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -32,6 +33,7 @@ class DefaultWalWriterTest {
         private int forceCount;
         private boolean throwOnWrite;
         private boolean throwOnForce;
+        private int failAfterBytes = -1;
 
         InMemoryChannelIO() {
             this.storage = new byte[256];
@@ -54,6 +56,21 @@ class DefaultWalWriterTest {
             checkNotClosed();
             if (throwOnWrite) {
                 throw new IOException("Simulated disk write error");
+            }
+            if (failAfterBytes >= 0) {
+                int toWrite = Math.min(src.remaining(), failAfterBytes);
+                if (toWrite > 0) {
+                    int endPos = (int) (position + toWrite);
+                    if (endPos > storage.length) {
+                        storage = Arrays.copyOf(storage, Math.max(storage.length * 2, endPos));
+                    }
+                    src.get(storage, (int) position, toWrite);
+                    if (endPos > size) {
+                        size = endPos;
+                    }
+                }
+                failAfterBytes = -1;
+                throw new IOException("Simulated partial write disk error");
             }
             int bytesToWrite = src.remaining();
             int endPos = (int) (position + bytesToWrite);
@@ -265,5 +282,38 @@ class DefaultWalWriterTest {
             writer.sync();
         }).isInstanceOf(StorageException.class)
           .satisfies(e -> assertThat(((StorageException) e).code()).isEqualTo(ErrorCode.IO));
+    }
+    @Test
+    @DisplayName("Partial write failure rolls back via truncate and allows clean subsequent appends")
+    void testPartialWriteRollbackViaTruncate() throws Exception {
+        InMemoryChannelIO channel = new InMemoryChannelIO();
+        DefaultWalWriter writer = DefaultWalWriter.create(channel, 10L, DurabilityMode.BUFFERED);
+
+        long off1 = writer.append(1L, RecordKind.PUT, bytes("key1"), bytes("value1"));
+        long validSizeBeforeFailure = channel.size();
+        assertThat(validSizeBeforeFailure).isGreaterThan(32L);
+
+        // Inject partial write failure: write 10 bytes then fail
+        channel.failAfterBytes = 10;
+        assertThatThrownBy(() -> writer.append(2L, RecordKind.PUT, bytes("key2"), bytes("value2_long_payload")))
+                .isInstanceOf(StorageException.class)
+                .satisfies(e -> assertThat(((StorageException) e).code()).isEqualTo(ErrorCode.IO));
+
+        // Invariant: channel must be truncated back to valid offset before failure
+        assertThat(channel.size()).isEqualTo(validSizeBeforeFailure);
+
+        // Subsequent append should succeed at the exact valid offset
+        long off2 = writer.append(3L, RecordKind.PUT, bytes("k3"), bytes("v3"));
+        assertThat(off2).isEqualTo(validSizeBeforeFailure);
+
+        // Verify reader parses cleanly without corrupted tail
+        try (DefaultWalReader reader = DefaultWalReader.open(channel, Path.of("test.wal"))) {
+            var cursor = reader.openCursor();
+            assertThat(cursor.advance()).isTrue();
+            assertThat(cursor.current().sequence()).isEqualTo(1L);
+            assertThat(cursor.advance()).isTrue();
+            assertThat(cursor.current().sequence()).isEqualTo(3L);
+            assertThat(cursor.advance()).isFalse();
+        }
     }
 }
