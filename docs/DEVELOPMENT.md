@@ -28,7 +28,7 @@ J-LSM реалізує спрощене Log-Structured Merge (LSM) дерево.
 
 ```mermaid
 flowchart TD
-    Client["Клієнтський застосунок"] --> API["io.jlsm.api.KVDatabase"]
+    Client["Клієнтський застосунок"] --> API["io.jlsm.api.KVDatabase<br>(put / get / delete / write / scan)"]
     API --> Engine["StorageEngine (Dev 1)<br>stateLock + lifecycle"]
       
     subgraph Dev1Scope["Зона Dev 1: RAM, WAL, Lifecycle & Manifest"]
@@ -46,7 +46,7 @@ flowchart TD
         Worker --> Compactor["Compactor Engine<br>(K-Way Merge + Dedup)"]
         SSTFiles --> Compactor
         Compactor --> SSTFiles
-        TableReader["SSTableReader<br>(Sparse Index + Block Loader)"]
+        TableReader["TableHandle (Dev 2)<br>(BloomFilter + SparseIndex + Block Loader)"]
         SSTFiles --> TableReader
         MergeCursor["MergedIterator<br>(PriorityQueue K-Way)"]
     end
@@ -636,7 +636,10 @@ flowchart TD
       
     CheckImm -->|Не знайдено| SearchDisk["3. DiskStorageReader.search"]
     SearchDisk --> LoopTables["Ітерація по SSTables від новіших до старіших"]
-    LoopTables --> BinarySearch["Бінарний пошук у SparseIndex блоку"]
+    LoopTables --> CheckBloom{"BloomFilter містить ключ? (Dev 2)"}
+    CheckBloom -->|Ні: пропуск файлу| NextTable["До наступної таблиці"]
+    NextTable --> LoopTables
+    CheckBloom -->|Так / можливо| BinarySearch["Бінарний пошук у SparseIndex блоку"]
     BinarySearch --> ReadBlock["Зчитування 4КБ Data Block"]
     ReadBlock --> ScanBlock["Пошук ключа в блоці"]
       
