@@ -5,6 +5,7 @@ import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.io.ChannelIO;
+import io.jlsm.internal.model.BatchOperation;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordCursor;
@@ -131,7 +132,7 @@ class DefaultWalReaderTest {
 
             assertThat(records).hasSize(2);
 
-            InternalRecord r1 = records.get(0);
+            InternalRecord r1 = records.getFirst();
             assertThat(r1.sequence()).isEqualTo(1L);
             assertThat(r1.kind()).isEqualTo(RecordKind.PUT);
             assertThat(r1.key()).isEqualTo(ByteKey.copyOf(bytes("key1")));
@@ -170,7 +171,7 @@ class DefaultWalReaderTest {
 
             assertThat(records).hasSize(4);
 
-            InternalRecord r1 = records.get(0);
+            InternalRecord r1 = records.getFirst();
             assertThat(r1.sequence()).isEqualTo(100L);
             assertThat(r1.kind()).isEqualTo(RecordKind.PUT);
             assertThat(r1.key()).isEqualTo(ByteKey.copyOf(bytes("user:1")));
@@ -279,7 +280,7 @@ class DefaultWalReaderTest {
                 }
             }
             assertThat(records).hasSize(1);
-            assertThat(records.get(0).sequence()).isEqualTo(1L);
+            assertThat(records.getFirst().sequence()).isEqualTo(1L);
         }
     }
 
@@ -343,6 +344,163 @@ class DefaultWalReaderTest {
             assertThat(cursor.advance()).isTrue();
             assertThat(cursor.current())
                     .isEqualTo(InternalRecord.of(ByteKey.copyOf(bytes("k")), new byte[0], RecordKind.PUT, 1L));
+        }
+    }
+
+    @Test
+    @DisplayName("Reads batch frame and yields individual records with sequential sequence numbers")
+    void testReadBatchFrameYieldsRecords() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 10L, DurabilityMode.BUFFERED)) {
+            List<BatchOperation> ops = List.of(
+                    BatchOperation.put(bytes("k1"), bytes("v1")),
+                    BatchOperation.delete(bytes("k2")),
+                    BatchOperation.put(bytes("k3"), new byte[0])
+            );
+            writer.appendBatch(500L, ops);
+        }
+
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(writeChannel.toByteArray());
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH);
+             RecordCursor cursor = reader.openCursor()) {
+
+            assertThat(cursor.advance()).isTrue();
+            InternalRecord r1 = cursor.current();
+            assertThat(r1.sequence()).isEqualTo(500L);
+            assertThat(r1.kind()).isEqualTo(RecordKind.PUT);
+            assertThat(r1.key()).isEqualTo(ByteKey.copyOf(bytes("k1")));
+            assertThat(r1.value()).isEqualTo(bytes("v1"));
+
+            assertThat(cursor.advance()).isTrue();
+            InternalRecord r2 = cursor.current();
+            assertThat(r2.sequence()).isEqualTo(501L);
+            assertThat(r2.kind()).isEqualTo(RecordKind.DELETE);
+            assertThat(r2.key()).isEqualTo(ByteKey.copyOf(bytes("k2")));
+            assertThat(r2.isTombstone()).isTrue();
+
+            assertThat(cursor.advance()).isTrue();
+            InternalRecord r3 = cursor.current();
+            assertThat(r3.sequence()).isEqualTo(502L);
+            assertThat(r3.kind()).isEqualTo(RecordKind.PUT);
+            assertThat(r3.key()).isEqualTo(ByteKey.copyOf(bytes("k3")));
+            assertThat(r3.value()).isNotNull().isEmpty();
+
+            assertThat(cursor.advance()).isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("Seamlessly interleaves single records and batch records in cursor iteration")
+    void testMixedSingleAndBatchRecords() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 1L, DurabilityMode.BUFFERED)) {
+            writer.append(1L, RecordKind.PUT, bytes("s1"), bytes("val1"));
+            writer.appendBatch(2L, List.of(
+                    BatchOperation.put(bytes("b1"), bytes("bval1")),
+                    BatchOperation.delete(bytes("b2"))
+            ));
+            writer.append(4L, RecordKind.DELETE, bytes("s2"), null);
+            writer.appendBatch(5L, List.of(
+                    BatchOperation.put(bytes("b3"), bytes("bval3"))
+            ));
+        }
+
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(writeChannel.toByteArray());
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH);
+             RecordCursor cursor = reader.openCursor()) {
+
+            List<Long> seqs = new ArrayList<>();
+            List<String> keys = new ArrayList<>();
+            while (cursor.advance()) {
+                seqs.add(cursor.current().sequence());
+                keys.add(new String(cursor.current().key().bytes(), StandardCharsets.UTF_8));
+            }
+
+            assertThat(seqs).containsExactly(1L, 2L, 3L, 4L, 5L);
+            assertThat(keys).containsExactly("s1", "b1", "b2", "s2", "b3");
+        }
+    }
+
+    @Test
+    @DisplayName("FI-01 / R-03: Torn batch at EOF during header write is truncated without recovering batch records")
+    void testTornBatchHeaderAtEOFIsTruncated() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        long validOffsetBefore;
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 1L, DurabilityMode.BUFFERED)) {
+            writer.append(1L, RecordKind.PUT, bytes("committedKey"), bytes("committedVal"));
+            validOffsetBefore = writer.writeOffset();
+            writer.appendBatch(2L, List.of(
+                    BatchOperation.put(bytes("torn1"), bytes("val1")),
+                    BatchOperation.put(bytes("torn2"), bytes("val2"))
+            ));
+        }
+
+        byte[] tornBytes = Arrays.copyOf(writeChannel.toByteArray(), (int) validOffsetBefore + 10);
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(tornBytes);
+
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH)) {
+            long recovered = reader.recoverAndTruncateTail();
+            assertThat(recovered).isEqualTo(validOffsetBefore);
+            assertThat(readChannel.size()).isEqualTo(validOffsetBefore);
+
+            try (RecordCursor cursor = reader.openCursor()) {
+                assertThat(cursor.advance()).isTrue();
+                assertThat(cursor.current().sequence()).isEqualTo(1L);
+                assertThat(cursor.advance()).isFalse();
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("FI-01 / R-03: Torn batch at EOF during payload write is truncated without recovering batch records")
+    void testTornBatchPayloadAtEOFIsTruncated() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        long validOffsetBefore;
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 1L, DurabilityMode.BUFFERED)) {
+            writer.append(1L, RecordKind.PUT, bytes("committedKey"), bytes("committedVal"));
+            validOffsetBefore = writer.writeOffset();
+            writer.appendBatch(2L, List.of(
+                    BatchOperation.put(bytes("torn1"), bytes("val1")),
+                    BatchOperation.put(bytes("torn2"), bytes("val2"))
+            ));
+        }
+
+        byte[] tornBytes = Arrays.copyOf(writeChannel.toByteArray(), (int) validOffsetBefore + 28);
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(tornBytes);
+
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH)) {
+            long recovered = reader.recoverAndTruncateTail();
+            assertThat(recovered).isEqualTo(validOffsetBefore);
+            assertThat(readChannel.size()).isEqualTo(validOffsetBefore);
+
+            try (RecordCursor cursor = reader.openCursor()) {
+                assertThat(cursor.advance()).isTrue();
+                assertThat(cursor.current().sequence()).isEqualTo(1L);
+                assertThat(cursor.advance()).isFalse();
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Corrupted batch frame CRC triggers CorruptedLogException during cursor advance")
+    void testCorruptedBatchCrcThrows() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 1L, DurabilityMode.BUFFERED)) {
+            writer.appendBatch(1L, List.of(
+                    BatchOperation.put(bytes("k1"), bytes("v1")),
+                    BatchOperation.put(bytes("k2"), bytes("v2"))
+            ));
+        }
+
+        byte[] corrupted = writeChannel.toByteArray();
+        corrupted[32 + 25] ^= 0x01; // flip bit in batch payload
+
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(corrupted);
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH);
+             RecordCursor cursor = reader.openCursor()) {
+            assertThatThrownBy(cursor::advance)
+                    .isInstanceOf(CorruptedLogException.class)
+                    .hasMessageContaining("Frame CRC mismatch");
         }
     }
 }

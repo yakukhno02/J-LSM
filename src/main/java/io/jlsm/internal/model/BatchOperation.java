@@ -1,6 +1,4 @@
-package io.jlsm.engine;
-
-import io.jlsm.internal.model.RecordKind;
+package io.jlsm.internal.model;
 
 import java.util.Arrays;
 import java.util.Objects;
@@ -25,6 +23,9 @@ public record BatchOperation(RecordKind kind, byte[] key, byte[] value) {
             if (value != null && value.length > 0) {
                 throw new IllegalArgumentException("value must be null or empty for DELETE operation");
             }
+            value = null;
+        } else {
+            throw new IllegalArgumentException("Unsupported batch operation kind: " + kind);
         }
     }
 

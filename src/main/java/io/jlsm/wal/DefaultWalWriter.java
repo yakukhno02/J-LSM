@@ -4,11 +4,13 @@ import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.io.ChannelIO;
+import io.jlsm.internal.model.BatchOperation;
 import io.jlsm.internal.model.RecordKind;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.List;
 import java.util.Objects;
 import java.util.zip.CRC32;
 
@@ -19,8 +21,9 @@ public final class DefaultWalWriter implements WalWriter {
     public static final int HEADER_SIZE = 32;
     public static final int MAX_KEY_VALUE_TOTAL_BYTES = 4063;
 
-    private static final byte TYPE_PUT = 0x01;
-    private static final byte TYPE_DELETE = 0x02;
+    public static final byte TYPE_PUT = 0x01;
+    public static final byte TYPE_DELETE = 0x02;
+    public static final byte TYPE_BATCH = 0x03;
 
     private final ChannelIO channel;
     private final DurabilityMode durabilityMode;
@@ -41,9 +44,9 @@ public final class DefaultWalWriter implements WalWriter {
         headerBuf.putInt(WAL_MAGIC);
         headerBuf.putInt(FORMAT_VERSION);
         headerBuf.putLong(fileId);
-        headerBuf.putInt(0); // Block size = 0 for WAL
-        headerBuf.putInt(0); // Reserved = 0
-        headerBuf.putInt(HEADER_SIZE); // Header size = 32
+        headerBuf.putInt(0);
+        headerBuf.putInt(0);
+        headerBuf.putInt(HEADER_SIZE);
 
         CRC32 crc32 = new CRC32();
         crc32.update(headerBuf.array(), 0, 28);
@@ -89,7 +92,6 @@ public final class DefaultWalWriter implements WalWriter {
             type = TYPE_PUT;
         } else {
             type = TYPE_DELETE;
-            // For DELETE, value length must be 0 and bytes omitted
             value = null;
         }
 
@@ -98,12 +100,11 @@ public final class DefaultWalWriter implements WalWriter {
                     + ") exceeds maximum allowed limit of " + MAX_KEY_VALUE_TOTAL_BYTES + " bytes");
         }
 
-        // Frame: CRC32(4B) + Sequence(8B) + Type(1B) + KeyLen(4B) + ValLen(4B) + Key(KeyLen) + Val(ValLen)
         int payloadLen = 8 + 1 + 4 + 4 + keyLen + valLen;
         int totalFrameLen = 4 + payloadLen;
 
         ByteBuffer frameBuf = ByteBuffer.allocate(totalFrameLen).order(ByteOrder.BIG_ENDIAN);
-        frameBuf.position(4); // reserve 4 bytes for CRC32
+        frameBuf.position(4);
 
         frameBuf.putLong(sequence);
         frameBuf.put(type);
@@ -137,6 +138,82 @@ public final class DefaultWalWriter implements WalWriter {
             }
             writeOffset = offsetWritten;
             throw new StorageException(ErrorCode.IO, "Failed to append record at sequence: " + sequence, e);
+        }
+
+        return offsetWritten;
+    }
+
+    @Override
+    public synchronized long appendBatch(long startSequence, List<BatchOperation> operations) throws StorageException {
+        ensureOpen();
+        Objects.requireNonNull(operations, "operations cannot be null");
+        if (operations.isEmpty()) {
+            throw new IllegalArgumentException("Batch operations cannot be empty");
+        }
+
+        int opCount = operations.size();
+        int batchPayloadLen = 0;
+        for (BatchOperation op : operations) {
+            Objects.requireNonNull(op, "batch operation cannot be null");
+            int keyLen = op.rawKey().length;
+            int valLen = (op.kind() == RecordKind.PUT && op.rawValue() != null) ? op.rawValue().length : 0;
+            if ((long) keyLen + valLen > MAX_KEY_VALUE_TOTAL_BYTES) {
+                throw new IllegalArgumentException("Combined key and value length (" + (keyLen + valLen)
+                        + ") exceeds maximum allowed limit of " + MAX_KEY_VALUE_TOTAL_BYTES + " bytes");
+            }
+            batchPayloadLen += (1 + 4 + 4 + keyLen + valLen);
+        }
+
+        int payloadLenAfterCrc = 8 + 1 + 4 + 4 + batchPayloadLen;
+        int totalFrameLen = 4 + payloadLenAfterCrc;
+
+        ByteBuffer frameBuf = ByteBuffer.allocate(totalFrameLen).order(ByteOrder.BIG_ENDIAN);
+        frameBuf.position(4);
+
+        frameBuf.putLong(startSequence);
+        frameBuf.put(TYPE_BATCH);
+        frameBuf.putInt(opCount);
+        frameBuf.putInt(batchPayloadLen);
+
+        for (BatchOperation op : operations) {
+            byte type = op.kind() == RecordKind.PUT ? TYPE_PUT : TYPE_DELETE;
+            byte[] key = op.rawKey();
+            byte[] val = op.rawValue();
+            int keyLen = key.length;
+            int valLen = (op.kind() == RecordKind.PUT && val != null) ? val.length : 0;
+
+            frameBuf.put(type);
+            frameBuf.putInt(keyLen);
+            frameBuf.putInt(valLen);
+            frameBuf.put(key);
+            if (op.kind() == RecordKind.PUT && valLen > 0) {
+                frameBuf.put(val);
+            }
+        }
+
+        CRC32 crc32 = new CRC32();
+        crc32.update(frameBuf.array(), 4, payloadLenAfterCrc);
+        int computedCrc = (int) crc32.getValue();
+
+        frameBuf.putInt(0, computedCrc);
+        frameBuf.position(0);
+
+        long offsetWritten = writeOffset;
+        try {
+            writeFully(channel, frameBuf, offsetWritten);
+            writeOffset += totalFrameLen;
+
+            if (durabilityMode == DurabilityMode.SYNC) {
+                channel.force(false);
+            }
+        } catch (IOException e) {
+            try {
+                channel.truncate(offsetWritten);
+            } catch (IOException truncateEx) {
+                e.addSuppressed(truncateEx);
+            }
+            writeOffset = offsetWritten;
+            throw new StorageException(ErrorCode.IO, "Failed to append batch at sequence: " + startSequence, e);
         }
 
         return offsetWritten;

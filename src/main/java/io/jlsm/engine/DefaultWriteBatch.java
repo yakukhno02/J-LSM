@@ -1,6 +1,7 @@
 package io.jlsm.engine;
 
 import io.jlsm.api.WriteBatch;
+import io.jlsm.internal.model.BatchOperation;
 
 import java.util.ArrayList;
 import java.util.Collections;

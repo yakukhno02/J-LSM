@@ -11,6 +11,7 @@ import io.jlsm.internal.model.RecordCursor;
 import org.junit.jupiter.api.io.TempDir;
 import java.util.ArrayList;
 import java.util.List;
+import io.jlsm.internal.model.BatchOperation;
 import io.jlsm.internal.model.RecordKind;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -352,5 +353,98 @@ class DefaultWalWriterTest {
             }
         }
         assertThat(keys).containsExactly("before", "small");
+    }
+
+    @Test
+    @DisplayName("appendBatch writes valid binary batch frame (0x03) matching layout and CRC")
+    void testAppendBatchLayoutAndCrc() throws StorageException {
+        InMemoryChannelIO channel = new InMemoryChannelIO();
+        DefaultWalWriter writer = DefaultWalWriter.create(channel, 10L, DurabilityMode.BUFFERED);
+
+        List<BatchOperation> ops = List.of(
+                BatchOperation.put(bytes("k1"), bytes("val1")),
+                BatchOperation.delete(bytes("k2")),
+                BatchOperation.put(bytes("k3"), bytes("val3"))
+        );
+
+        long offset = writer.appendBatch(100L, ops);
+        assertThat(offset).isEqualTo(32L);
+
+        int expectedFrameLen = 21 + 41;
+        assertThat(writer.writeOffset()).isEqualTo(32L + expectedFrameLen);
+        assertThat(channel.size()).isEqualTo(32L + expectedFrameLen);
+
+        byte[] data = channel.toByteArray();
+        ByteBuffer buf = ByteBuffer.wrap(data, 32, expectedFrameLen).order(ByteOrder.BIG_ENDIAN);
+
+        int storedCrc = buf.getInt();
+        long startSeq = buf.getLong();
+        byte type = buf.get();
+        int opCount = buf.getInt();
+        int payloadLen = buf.getInt();
+
+        assertThat(startSeq).isEqualTo(100L);
+        assertThat(type).isEqualTo(DefaultWalWriter.TYPE_BATCH);
+        assertThat(opCount).isEqualTo(3);
+        assertThat(payloadLen).isEqualTo(41);
+
+        CRC32 crc32 = new CRC32();
+        crc32.update(data, 36, expectedFrameLen - 4);
+        assertThat(storedCrc).isEqualTo((int) crc32.getValue());
+    }
+
+    @Test
+    @DisplayName("appendBatch validates inputs: null list, empty list, and closed writer")
+    void testAppendBatchValidations() throws StorageException {
+        InMemoryChannelIO channel = new InMemoryChannelIO();
+        DefaultWalWriter writer = DefaultWalWriter.create(channel, 1L, DurabilityMode.BUFFERED);
+
+        assertThatThrownBy(() -> writer.appendBatch(1L, null))
+                .isInstanceOf(NullPointerException.class);
+
+        assertThatThrownBy(() -> writer.appendBatch(1L, List.of()))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        writer.close();
+        assertThatThrownBy(() -> writer.appendBatch(1L, List.of(BatchOperation.delete(bytes("k")))))
+                .isInstanceOf(StorageException.class)
+                .satisfies(e -> assertThat(((StorageException) e).code()).isEqualTo(ErrorCode.CLOSED));
+    }
+
+    @Test
+    @DisplayName("appendBatch with DurabilityMode.SYNC forces channel write")
+    void testAppendBatchDurabilitySync() throws StorageException {
+        InMemoryChannelIO channel = new InMemoryChannelIO();
+        DefaultWalWriter writer = DefaultWalWriter.create(channel, 1L, DurabilityMode.SYNC);
+        assertThat(channel.forceCount).isEqualTo(1);
+
+        writer.appendBatch(1L, List.of(BatchOperation.put(bytes("k"), bytes("v"))));
+        assertThat(channel.forceCount).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("appendBatch partial write failure rolls back via truncate")
+    void testAppendBatchPartialWriteRollback() throws Exception {
+        InMemoryChannelIO channel = new InMemoryChannelIO();
+        DefaultWalWriter writer = DefaultWalWriter.create(channel, 10L, DurabilityMode.BUFFERED);
+
+        writer.append(1L, RecordKind.PUT, bytes("key1"), bytes("val1"));
+        long validOffsetBefore = channel.size();
+
+        channel.failAfterBytes = 15;
+        List<BatchOperation> ops = List.of(
+                BatchOperation.put(bytes("b1"), bytes("batchVal1")),
+                BatchOperation.put(bytes("b2"), bytes("batchVal2"))
+        );
+
+        assertThatThrownBy(() -> writer.appendBatch(2L, ops))
+                .isInstanceOf(StorageException.class)
+                .satisfies(e -> assertThat(((StorageException) e).code()).isEqualTo(ErrorCode.IO));
+
+        assertThat(channel.size()).isEqualTo(validOffsetBefore);
+        assertThat(writer.writeOffset()).isEqualTo(validOffsetBefore);
+
+        long nextOff = writer.append(2L, RecordKind.PUT, bytes("keyOk"), bytes("valOk"));
+        assertThat(nextOff).isEqualTo(validOffsetBefore);
     }
 }

@@ -1,6 +1,7 @@
 package io.jlsm.engine;
 
 import io.jlsm.api.WriteBatch;
+import io.jlsm.internal.model.BatchOperation;
 import io.jlsm.internal.model.RecordKind;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;

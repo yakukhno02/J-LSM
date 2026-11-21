@@ -17,6 +17,7 @@ import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordCursor;
 import io.jlsm.internal.model.RecordKind;
+import io.jlsm.internal.model.BatchOperation;
 import io.jlsm.manifest.DefaultManifestCompactor;
 import io.jlsm.manifest.DefaultManifestStore;
 import io.jlsm.manifest.ManifestSnapshot;
