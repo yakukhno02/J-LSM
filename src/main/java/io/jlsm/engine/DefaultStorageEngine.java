@@ -6,6 +6,7 @@ import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.api.WriteBatch;
 import io.jlsm.api.StorageMetrics;
 import io.jlsm.compaction.Compactor;
 import io.jlsm.compaction.DefaultCompactor;
@@ -239,6 +240,41 @@ public final class DefaultStorageEngine implements KVDatabase {
             ByteKey byteKey = ByteKey.copyOf(key);
             long delta = activeMemTable.insert(byteKey, new InternalRecord.Delete(byteKey, seq));
             memoryBudgetManager.update(delta);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    @Override
+    public void write(WriteBatch batch) throws StorageException {
+        if (batch == null) {
+            throw new IllegalArgumentException("batch cannot be null");
+        }
+        if (batch.isEmpty()) {
+            throw new IllegalArgumentException("batch cannot be empty");
+        }
+        if (!(batch instanceof DefaultWriteBatch defaultBatch)) {
+            throw new IllegalArgumentException("Unsupported WriteBatch implementation: " + batch.getClass().getName());
+        }
+
+        memoryBudgetManager.checkBackpressure();
+
+        stateLock.lock();
+        try {
+            ensureOpen();
+            checkAndRotateMemTable();
+
+            List<BatchOperation> ops = defaultBatch.operations();
+            for (BatchOperation op : ops) {
+                long seq = ++highSequence;
+                activeWalWriter.append(seq, op.kind(), op.rawKey(), op.rawValue());
+                ByteKey byteKey = ByteKey.copyOf(op.rawKey());
+                InternalRecord record = op.kind() == io.jlsm.internal.model.RecordKind.PUT
+                        ? new InternalRecord.Put(byteKey, op.rawValue(), seq)
+                        : new InternalRecord.Delete(byteKey, seq);
+                long delta = activeMemTable.insert(byteKey, record);
+                memoryBudgetManager.update(delta);
+            }
         } finally {
             stateLock.unlock();
         }
