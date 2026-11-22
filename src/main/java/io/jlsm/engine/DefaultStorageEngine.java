@@ -266,15 +266,26 @@ public final class DefaultStorageEngine implements KVDatabase {
             checkAndRotateMemTable();
 
             List<BatchOperation> ops = defaultBatch.operations();
-            for (BatchOperation op : ops) {
-                long seq = ++highSequence;
-                activeWalWriter.append(seq, op.kind(), op.rawKey(), op.rawValue());
+            int count = ops.size();
+            long startSeq = highSequence + 1;
+
+            activeWalWriter.appendBatch(startSeq, ops);
+            highSequence += count;
+
+            for (int i = 0; i < count; i++) {
+                BatchOperation op = ops.get(i);
+                long seq = startSeq + i;
                 ByteKey byteKey = ByteKey.copyOf(op.rawKey());
-                InternalRecord record = op.kind() == io.jlsm.internal.model.RecordKind.PUT
+                InternalRecord record = op.kind() == RecordKind.PUT
                         ? new InternalRecord.Put(byteKey, op.rawValue(), seq)
                         : new InternalRecord.Delete(byteKey, seq);
                 long delta = activeMemTable.insert(byteKey, record);
                 memoryBudgetManager.update(delta);
+                if (op.kind() == RecordKind.PUT) {
+                    putsCount.incrementAndGet();
+                } else {
+                    deletesCount.incrementAndGet();
+                }
             }
         } finally {
             stateLock.unlock();
@@ -400,7 +411,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                 } catch (Exception e) {
                     StorageException se = new StorageException(ErrorCode.IO, "Failed to close TableHandle", e);
                     if (firstException == null) firstException = se;
-                    else if (firstException != se) firstException.addSuppressed(se);
+                    else if (!firstException.equals(se)) firstException.addSuppressed(se);
                 }
             }
             liveTables.clear();
@@ -417,7 +428,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             } catch (Exception e) {
                 StorageException se = new StorageException(ErrorCode.IO, "Failed to release LOCK", e);
                 if (firstException == null) firstException = se;
-                else if (firstException != se) firstException.addSuppressed(se);
+                else if (!firstException.equals(se)) firstException.addSuppressed(se);
             }
 
             if (firstException != null) {
@@ -680,9 +691,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                     updatedTables.add(meta);
                 }
             }
-            if (compactedMeta.isPresent()) {
-                updatedTables.add(compactedMeta.get());
-            }
+            compactedMeta.ifPresent(updatedTables::add);
 
             ManifestSnapshot nextSnapshot = new ManifestSnapshot(
                     ++currentEpoch,

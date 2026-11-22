@@ -5,6 +5,8 @@ import io.jlsm.api.ErrorCode;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.io.StandardStorageIO;
 import io.jlsm.internal.io.StorageIO;
+import io.jlsm.internal.model.BatchOperation;
+import java.util.List;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordKind;
@@ -211,6 +213,52 @@ class RecoveryManagerTest {
             assertThat(Files.exists(orphanWal)).isTrue();
             // Should be a valid empty WAL, not corrupted garbage
             assertThat(Files.size(orphanWal)).isEqualTo(DefaultWalWriter.HEADER_SIZE);
+        } finally {
+            res2.activeWalWriter().close();
+            res2.manifestStore().close();
+            res2.lockHandle().close();
+        }
+    }
+
+    @Test
+    @DisplayName("RecoveryManager replays WAL batch frames and advances highSequence correctly")
+    void testRecoveryReplaysBatchFrames(@TempDir Path tempDir) throws Exception {
+        StorageIO storageIO = new StandardStorageIO();
+        DatabaseOptions options = DatabaseOptions.defaults();
+
+        RecoveryManager manager1 = new RecoveryManager(storageIO, tempDir, options);
+        RecoveryResult res1 = manager1.recover();
+        long wal1Id = res1.activeWalId();
+
+        WalWriter writer = res1.activeWalWriter();
+        writer.append(1L, RecordKind.PUT, bytes("key1"), bytes("val1"));
+        writer.appendBatch(2L, List.of(
+                BatchOperation.put(bytes("key2"), bytes("val2")),
+                BatchOperation.delete(bytes("key1")),
+                BatchOperation.put(bytes("key3"), bytes("val3"))
+        ));
+        writer.close();
+        res1.manifestStore().close();
+        res1.lockHandle().close();
+
+        RecoveryManager manager2 = new RecoveryManager(storageIO, tempDir, options);
+        RecoveryResult res2 = manager2.recover();
+
+        try {
+            assertThat(res2.highSequence()).isEqualTo(4L);
+            assertThat(res2.activeWalId()).isGreaterThan(wal1Id);
+
+            Optional<InternalRecord> r1 = res2.activeMemTable().get(key("key1"));
+            assertThat(r1).isPresent();
+            assertThat(r1.get().isTombstone()).isTrue();
+
+            Optional<InternalRecord> r2 = res2.activeMemTable().get(key("key2"));
+            assertThat(r2).isPresent();
+            assertThat(r2.get().value()).isEqualTo(bytes("val2"));
+
+            Optional<InternalRecord> r3 = res2.activeMemTable().get(key("key3"));
+            assertThat(r3).isPresent();
+            assertThat(r3.get().value()).isEqualTo(bytes("val3"));
         } finally {
             res2.activeWalWriter().close();
             res2.manifestStore().close();
