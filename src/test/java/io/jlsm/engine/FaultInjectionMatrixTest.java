@@ -5,6 +5,7 @@ import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.api.WriteBatch;
 import io.jlsm.internal.io.FaultInjectingStorage;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -149,6 +150,89 @@ class FaultInjectionMatrixTest {
 
         try (KVDatabase reopened = KVDatabase.open(testDir, options)) {
             assertThat(asString(reopened.get(bytes("keyA")))).isEqualTo("valA");
+        }
+    }
+
+    @Test
+    @DisplayName("Short write during WAL batch append preserves all-or-nothing invariant")
+    void testBatchShortWriteAllOrNothing() throws Exception {
+        Path testDir = Files.createTempDirectory(tempDir, "batch-short-write-");
+        FaultInjectingStorage faultStorage = new FaultInjectingStorage();
+        DatabaseOptions options = DatabaseOptions.defaults().withDurabilityMode(DurabilityMode.BUFFERED);
+
+        RecoveryResult rec = new RecoveryManager(faultStorage, testDir, options).recover();
+        DefaultStorageEngine engine = new DefaultStorageEngine(faultStorage, testDir, options, rec);
+
+        engine.put(bytes("base_k"), bytes("base_v"));
+
+        // Cut the channel mid-batch
+        faultStorage.failAfterBytesWritten(60);
+
+        try (WriteBatch batch = WriteBatch.create()) {
+            for (int i = 0; i < 5; i++) {
+                batch.put(bytes("batch_k" + i), bytes("batch_v" + i));
+            }
+
+            assertThatThrownBy(() -> engine.write(batch))
+                    .isInstanceOf(StorageException.class);
+        }
+
+        faultStorage.reset();
+        engine.close();
+
+        try (KVDatabase reopened = KVDatabase.open(testDir, options)) {
+            assertThat(asString(reopened.get(bytes("base_k")))).isEqualTo("base_v");
+
+            int visibleBatchKeys = 0;
+            for (int i = 0; i < 5; i++) {
+                if (reopened.get(bytes("batch_k" + i)) != null) {
+                    visibleBatchKeys++;
+                }
+            }
+            assertThat(visibleBatchKeys).isZero();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {1, 2, 3, 5, 8})
+    @DisplayName("N-th call I/O failure during batch write satisfies all-or-nothing invariant upon reopen")
+    void testBatchFailureOnNthIoCall(long nthCall) throws Exception {
+        Path testDir = Files.createTempDirectory(tempDir, "batch-nth-" + nthCall + "-");
+        FaultInjectingStorage faultStorage = new FaultInjectingStorage();
+        DatabaseOptions options = DatabaseOptions.defaults().withDurabilityMode(DurabilityMode.SYNC);
+
+        RecoveryResult rec = new RecoveryManager(faultStorage, testDir, options).recover();
+        DefaultStorageEngine engine = new DefaultStorageEngine(faultStorage, testDir, options, rec);
+
+        engine.put(bytes("stable_key"), bytes("stable_val"));
+
+        faultStorage.failOnNthIoCall(nthCall);
+
+        try (WriteBatch batch = WriteBatch.create()) {
+            for (int i = 0; i < 4; i++) {
+                batch.put(bytes("b_k" + i), bytes("b_v" + i));
+            }
+            try {
+                engine.write(batch);
+            } catch (StorageException expected) {
+            }
+        } finally {
+            faultStorage.reset();
+            try {
+                engine.close();
+            } catch (Exception ignored) {}
+        }
+
+        try (KVDatabase reopened = KVDatabase.open(testDir, options)) {
+            assertThat(asString(reopened.get(bytes("stable_key")))).isEqualTo("stable_val");
+
+            int count = 0;
+            for (int i = 0; i < 4; i++) {
+                if (reopened.get(bytes("b_k" + i)) != null) {
+                    count++;
+                }
+            }
+            assertThat(count).isIn(0, 4);
         }
     }
 }
