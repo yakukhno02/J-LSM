@@ -7,6 +7,7 @@ import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.api.WriteBatch;
 import io.jlsm.internal.io.FaultInjectingStorage;
 import io.jlsm.internal.io.StandardStorageIO;
 import java.time.Duration;
@@ -725,6 +726,112 @@ class DefaultStorageEngineTest {
                 }
             }
             assertThat(keys).containsExactly("a", "b", "c", "d", "e");
+        }
+    }
+
+    @Test
+    @DisplayName("WriteBatch executes puts and deletes atomically in the engine")
+    void testWriteBatchAtomicExecution(@TempDir Path tempDir) throws Exception {
+        try (KVDatabase db = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            db.put(bytes("k1"), bytes("v1_orig"));
+            db.put(bytes("k2"), bytes("v2_orig"));
+            db.put(bytes("k3"), bytes("v3_orig"));
+
+            try (WriteBatch batch = WriteBatch.create()) {
+                batch.put(bytes("k1"), bytes("v1_batch"));
+                batch.delete(bytes("k2"));
+                batch.put(bytes("k4"), bytes("v4_new"));
+                db.write(batch);
+            }
+
+            assertThat(asString(db.get(bytes("k1")))).isEqualTo("v1_batch");
+            assertThat(db.get(bytes("k2"))).isNull();
+            assertThat(asString(db.get(bytes("k3")))).isEqualTo("v3_orig");
+            assertThat(asString(db.get(bytes("k4")))).isEqualTo("v4_new");
+        }
+    }
+
+    @Test
+    @DisplayName("WriteBatch updates are immediately visible in scan")
+    void testWriteBatchScanVisibility(@TempDir Path tempDir) throws Exception {
+        try (KVDatabase db = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            try (WriteBatch batch = WriteBatch.create()) {
+                batch.put(bytes("user:1"), bytes("Alice"));
+                batch.put(bytes("user:2"), bytes("Bob"));
+                batch.put(bytes("user:3"), bytes("Charlie"));
+                db.write(batch);
+            }
+
+            List<String> values = new ArrayList<>();
+            try (ClosableIterator<Entry> it = db.scan(bytes("user:1"), bytes("user:4"))) {
+                while (it.hasNext()) {
+                    values.add(asString(it.next().value()));
+                }
+            }
+
+            assertThat(values).containsExactly("Alice", "Bob", "Charlie");
+        }
+    }
+
+    @Test
+    @DisplayName("WriteBatch validates input parameters: null batch, empty batch, and closed database")
+    void testWriteBatchValidations(@TempDir Path tempDir) throws Exception {
+        try (KVDatabase db = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            assertThatThrownBy(() -> db.write(null))
+                    .isInstanceOf(IllegalArgumentException.class);
+
+            try (WriteBatch empty = WriteBatch.create()) {
+                assertThatThrownBy(() -> db.write(empty))
+                        .isInstanceOf(IllegalArgumentException.class);
+            }
+        }
+
+        KVDatabase closedDb = KVDatabase.open(tempDir, DatabaseOptions.defaults());
+        closedDb.close();
+
+        try (WriteBatch batch = WriteBatch.create()) {
+            batch.put(bytes("k"), bytes("v"));
+            assertThatThrownBy(() -> closedDb.write(batch))
+                    .isInstanceOf(StorageException.class)
+                    .satisfies(e -> assertThat(((StorageException) e).code()).isEqualTo(ErrorCode.CLOSED));
+        }
+    }
+
+    @Test
+    @DisplayName("WriteBatch updates storage metrics for put and delete counts")
+    void testWriteBatchMetrics(@TempDir Path tempDir) throws Exception {
+        try (KVDatabase db = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            long putsBefore = db.metrics().putsCount();
+            long delsBefore = db.metrics().deletesCount();
+
+            try (WriteBatch batch = WriteBatch.create()) {
+                batch.put(bytes("k1"), bytes("v1"));
+                batch.put(bytes("k2"), bytes("v2"));
+                batch.delete(bytes("k3"));
+                db.write(batch);
+            }
+
+            assertThat(db.metrics().putsCount()).isEqualTo(putsBefore + 2);
+            assertThat(db.metrics().deletesCount()).isEqualTo(delsBefore + 1);
+        }
+    }
+
+    @Test
+    @DisplayName("Batch written data survives database restart and WAL replay")
+    void testWriteBatchSurvivesRestart(@TempDir Path tempDir) throws Exception {
+        try (KVDatabase db = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            try (WriteBatch batch = WriteBatch.create()) {
+                batch.put(bytes("alpha"), bytes("valAlpha"));
+                batch.put(bytes("beta"), bytes("valBeta"));
+                batch.delete(bytes("gamma"));
+                db.write(batch);
+            }
+        }
+
+        try (KVDatabase reopened = KVDatabase.open(tempDir, DatabaseOptions.defaults())) {
+            assertThat(asString(reopened.get(bytes("alpha")))).isEqualTo("valAlpha");
+            assertThat(asString(reopened.get(bytes("beta")))).isEqualTo("valBeta");
+            assertThat(reopened.get(bytes("gamma"))).isNull();
         }
     }
 }

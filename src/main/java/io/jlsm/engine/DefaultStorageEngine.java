@@ -6,6 +6,7 @@ import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
 import io.jlsm.api.StorageException;
+import io.jlsm.api.WriteBatch;
 import io.jlsm.api.StorageMetrics;
 import io.jlsm.compaction.Compactor;
 import io.jlsm.compaction.DefaultCompactor;
@@ -16,6 +17,7 @@ import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordCursor;
 import io.jlsm.internal.model.RecordKind;
+import io.jlsm.internal.model.BatchOperation;
 import io.jlsm.manifest.DefaultManifestCompactor;
 import io.jlsm.manifest.DefaultManifestStore;
 import io.jlsm.manifest.ManifestSnapshot;
@@ -245,6 +247,52 @@ public final class DefaultStorageEngine implements KVDatabase {
     }
 
     @Override
+    public void write(WriteBatch batch) throws StorageException {
+        if (batch == null) {
+            throw new IllegalArgumentException("batch cannot be null");
+        }
+        if (batch.isEmpty()) {
+            throw new IllegalArgumentException("batch cannot be empty");
+        }
+        if (!(batch instanceof DefaultWriteBatch defaultBatch)) {
+            throw new IllegalArgumentException("Unsupported WriteBatch implementation: " + batch.getClass().getName());
+        }
+
+        memoryBudgetManager.checkBackpressure();
+
+        stateLock.lock();
+        try {
+            ensureOpen();
+            checkAndRotateMemTable();
+
+            List<BatchOperation> ops = defaultBatch.operations();
+            int count = ops.size();
+            long startSeq = highSequence + 1;
+
+            activeWalWriter.appendBatch(startSeq, ops);
+            highSequence += count;
+
+            for (int i = 0; i < count; i++) {
+                BatchOperation op = ops.get(i);
+                long seq = startSeq + i;
+                ByteKey byteKey = ByteKey.copyOf(op.rawKey());
+                InternalRecord record = op.kind() == RecordKind.PUT
+                        ? new InternalRecord.Put(byteKey, op.rawValue(), seq)
+                        : new InternalRecord.Delete(byteKey, seq);
+                long delta = activeMemTable.insert(byteKey, record);
+                memoryBudgetManager.update(delta);
+                if (op.kind() == RecordKind.PUT) {
+                    putsCount.incrementAndGet();
+                } else {
+                    deletesCount.incrementAndGet();
+                }
+            }
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    @Override
     public ClosableIterator<Entry> scan(byte[] fromKey, byte[] toKey) throws StorageException {
         scansCount.incrementAndGet();
         ByteKey from = fromKey != null ? ByteKey.copyOf(fromKey) : null;
@@ -363,7 +411,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                 } catch (Exception e) {
                     StorageException se = new StorageException(ErrorCode.IO, "Failed to close TableHandle", e);
                     if (firstException == null) firstException = se;
-                    else if (firstException != se) firstException.addSuppressed(se);
+                    else if (!firstException.equals(se)) firstException.addSuppressed(se);
                 }
             }
             liveTables.clear();
@@ -380,7 +428,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             } catch (Exception e) {
                 StorageException se = new StorageException(ErrorCode.IO, "Failed to release LOCK", e);
                 if (firstException == null) firstException = se;
-                else if (firstException != se) firstException.addSuppressed(se);
+                else if (!firstException.equals(se)) firstException.addSuppressed(se);
             }
 
             if (firstException != null) {
@@ -643,9 +691,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                     updatedTables.add(meta);
                 }
             }
-            if (compactedMeta.isPresent()) {
-                updatedTables.add(compactedMeta.get());
-            }
+            compactedMeta.ifPresent(updatedTables::add);
 
             ManifestSnapshot nextSnapshot = new ManifestSnapshot(
                     ++currentEpoch,
