@@ -235,4 +235,65 @@ class DefaultMemTableTest {
         }
         assertThat(count).isEqualTo(threads * perThread);
     }
+
+    @Test
+    @DisplayName("Historical get and scan with maxSequence isolation in MemTable")
+    void testHistoricalGetAndScan() throws StorageException {
+        DefaultMemTable memTable = new DefaultMemTable();
+        ByteKey kA = key("keyA");
+        ByteKey kB = key("keyB");
+
+        memTable.insert(kA, putRecord("keyA", "v1", 10L));
+        memTable.insert(kB, putRecord("keyB", "v1", 15L));
+
+        // Update keyA at seq 20
+        memTable.insert(kA, putRecord("keyA", "v2", 20L));
+        // Delete keyB at seq 25
+        memTable.insert(kB, deleteRecord("keyB", 25L));
+        // Insert keyC at seq 30
+        memTable.insert(key("keyC"), putRecord("keyC", "v1", 30L));
+
+        // Read at seq 5: nothing existed
+        assertThat(memTable.get(kA, 5L)).isEmpty();
+        assertThat(memTable.get(kB, 5L)).isEmpty();
+
+        // Read at seq 12: keyA is v1, keyB does not exist yet
+        assertThat(memTable.get(kA, 12L)).isPresent().contains(putRecord("keyA", "v1", 10L));
+        assertThat(memTable.get(kB, 12L)).isEmpty();
+
+        // Read at seq 18: keyA is v1, keyB is v1
+        assertThat(memTable.get(kA, 18L)).isPresent().contains(putRecord("keyA", "v1", 10L));
+        assertThat(memTable.get(kB, 18L)).isPresent().contains(putRecord("keyB", "v1", 15L));
+
+        // Read at seq 22: keyA is v2, keyB is v1
+        assertThat(memTable.get(kA, 22L)).isPresent().contains(putRecord("keyA", "v2", 20L));
+        assertThat(memTable.get(kB, 22L)).isPresent().contains(putRecord("keyB", "v1", 15L));
+
+        // Read at seq 28: keyA is v2, keyB is tombstone
+        assertThat(memTable.get(kA, 28L)).isPresent().contains(putRecord("keyA", "v2", 20L));
+        Optional<InternalRecord> bAt28 = memTable.get(kB, 28L);
+        assertThat(bAt28).isPresent();
+        assertThat(bAt28.get().isTombstone()).isTrue();
+
+        // Scan at seq 18: only keyA and keyB with v1 should be emitted
+        List<String> scan18 = new ArrayList<>();
+        try (RecordCursor cursor = memTable.scan(null, null, 18L)) {
+            while (cursor.advance()) {
+                scan18.add(new String(cursor.current().key().bytes(), StandardCharsets.UTF_8)
+                        + "=" + new String(cursor.current().value(), StandardCharsets.UTF_8));
+            }
+        }
+        assertThat(scan18).containsExactly("keyA=v1", "keyB=v1");
+
+        // Scan at seq 35: keyA=v2, keyB is tombstone, keyC=v1
+        List<String> scan35 = new ArrayList<>();
+        try (RecordCursor cursor = memTable.scan(null, null, 35L)) {
+            while (cursor.advance()) {
+                InternalRecord rec = cursor.current();
+                scan35.add(new String(rec.key().bytes(), StandardCharsets.UTF_8)
+                        + (rec.isTombstone() ? "=tombstone" : "=" + new String(rec.value(), StandardCharsets.UTF_8)));
+            }
+        }
+        assertThat(scan35).containsExactly("keyA=v2", "keyB=tombstone", "keyC=v1");
+    }
 }
