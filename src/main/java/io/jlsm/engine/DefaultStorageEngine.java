@@ -5,6 +5,7 @@ import io.jlsm.api.DatabaseOptions;
 import io.jlsm.api.Entry;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.KVDatabase;
+import io.jlsm.api.Snapshot;
 import io.jlsm.api.StorageException;
 import io.jlsm.api.WriteBatch;
 import io.jlsm.api.StorageMetrics;
@@ -26,7 +27,6 @@ import io.jlsm.manifest.TableMeta;
 import io.jlsm.manifest.WalMeta;
 import io.jlsm.mem.DefaultMemTable;
 import io.jlsm.mem.MemTable;
-import io.jlsm.merge.DefaultMergedIterator;
 import io.jlsm.sst.DefaultDiskStorageReader;
 import io.jlsm.sst.DefaultSSTableFlusher;
 import io.jlsm.sst.DefaultTableHandle;
@@ -74,6 +74,7 @@ public final class DefaultStorageEngine implements KVDatabase {
     private final Condition capacityAvailable = stateLock.newCondition();
 
     private final Set<ClosableIterator<?>> openScans = ConcurrentHashMap.newKeySet();
+    private final Set<DefaultSnapshot> openSnapshots = ConcurrentHashMap.newKeySet();
     private final ExecutorService backgroundWorker;
     private final AtomicBoolean isCompacting = new AtomicBoolean(false);
     private final AtomicReference<StorageException> backgroundError = new AtomicReference<>();
@@ -164,8 +165,22 @@ public final class DefaultStorageEngine implements KVDatabase {
 
     @Override
     public void put(byte[] key, byte[] value) throws StorageException {
-        validateKeyValue(key, value, false);
-        putsCount.incrementAndGet();
+        applyMutation(key, value, RecordKind.PUT);
+    }
+
+    @Override
+    public void delete(byte[] key) throws StorageException {
+        applyMutation(key, null, RecordKind.DELETE);
+    }
+
+    private void applyMutation(byte[] key, byte[] value, RecordKind kind) throws StorageException {
+        boolean isDelete = kind == RecordKind.DELETE;
+        validateKeyValue(key, value, isDelete);
+        if (isDelete) {
+            deletesCount.incrementAndGet();
+        } else {
+            putsCount.incrementAndGet();
+        }
         memoryBudgetManager.checkBackpressure();
 
         stateLock.lock();
@@ -173,9 +188,12 @@ public final class DefaultStorageEngine implements KVDatabase {
             ensureOpen();
             checkAndRotateMemTable();
             long seq = ++highSequence;
-            activeWalWriter.append(seq, RecordKind.PUT, key, value);
+            activeWalWriter.append(seq, kind, key, value);
             ByteKey byteKey = ByteKey.copyOf(key);
-            long delta = activeMemTable.insert(byteKey, new InternalRecord.Put(byteKey, value, seq));
+            InternalRecord record = isDelete
+                    ? new InternalRecord.Delete(byteKey, seq)
+                    : new InternalRecord.Put(byteKey, value, seq);
+            long delta = activeMemTable.insert(byteKey, record);
             memoryBudgetManager.update(delta);
         } finally {
             stateLock.unlock();
@@ -207,11 +225,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                 }
             }
 
-            pinnedTables = new ArrayList<>(liveTables.size());
-            for (TableHandle handle : liveTables) {
-                handle.pin();
-                pinnedTables.add(handle);
-            }
+            pinnedTables = pinLiveTables();
         } finally {
             stateLock.unlock();
         }
@@ -220,29 +234,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             Optional<InternalRecord> diskRec = diskStorageReader.search(pinnedTables, byteKey);
             return diskRec.map(this::extractValue).orElse(null);
         } finally {
-            for (TableHandle handle : pinnedTables) {
-                handle.unpin();
-            }
-        }
-    }
-
-    @Override
-    public void delete(byte[] key) throws StorageException {
-        validateKeyValue(key, null, true);
-        deletesCount.incrementAndGet();
-        memoryBudgetManager.checkBackpressure();
-
-        stateLock.lock();
-        try {
-            ensureOpen();
-            checkAndRotateMemTable();
-            long seq = ++highSequence;
-            activeWalWriter.append(seq, RecordKind.DELETE, key, null);
-            ByteKey byteKey = ByteKey.copyOf(key);
-            long delta = activeMemTable.insert(byteKey, new InternalRecord.Delete(byteKey, seq));
-            memoryBudgetManager.update(delta);
-        } finally {
-            stateLock.unlock();
+            unpinTables(pinnedTables);
         }
     }
 
@@ -295,15 +287,6 @@ public final class DefaultStorageEngine implements KVDatabase {
     @Override
     public ClosableIterator<Entry> scan(byte[] fromKey, byte[] toKey) throws StorageException {
         scansCount.incrementAndGet();
-        ByteKey from = fromKey != null ? ByteKey.copyOf(fromKey) : null;
-        ByteKey to = toKey != null ? ByteKey.copyOf(toKey) : null;
-
-        if (from != null && to != null && from.compareTo(to) > 0) {
-            return new EmptyClosableIterator();
-        }
-
-        List<RecordCursor> cursors = new ArrayList<>();
-        List<TableHandle> pinnedTables = new ArrayList<>();
 
         stateLock.lock();
         try {
@@ -312,37 +295,54 @@ public final class DefaultStorageEngine implements KVDatabase {
                 throw new StorageException(ErrorCode.LIMIT_EXCEEDED,
                         "Maximum concurrent scans limit reached: " + options.maxOpenScans());
             }
-
-            cursors.add(activeMemTable.scan(from, to));
-
-            if (immutableMemTable != null) {
-                cursors.add(immutableMemTable.scan(from, to));
-            }
-
-            for (TableHandle handle : liveTables) {
-                handle.pin();
-                pinnedTables.add(handle);
-            }
         } finally {
             stateLock.unlock();
         }
 
+        Snapshot snap = snapshot();
         try {
-            RecordCursor diskCursor = diskStorageReader.scanDisk(pinnedTables, from, to);
-            cursors.add(diskCursor);
-
-            DefaultMergedIterator merged = new DefaultMergedIterator(cursors, false);
-            ScanIterator scanIterator = new ScanIterator(merged, pinnedTables);
+            ClosableIterator<Entry> inner = snap.scan(fromKey, toKey);
+            ScanIterator scanIterator = new ScanIterator(inner, snap);
             openScans.add(scanIterator);
             return scanIterator;
         } catch (Exception e) {
-            for (TableHandle handle : pinnedTables) {
-                handle.unpin();
-            }
+            snap.close();
             if (e instanceof StorageException se) {
                 throw se;
             }
             throw new StorageException(ErrorCode.IO, "Failed to initialize scan iterator", e);
+        }
+    }
+
+    @Override
+    public Snapshot snapshot() throws StorageException {
+        stateLock.lock();
+        try {
+            ensureOpen();
+            long seq = highSequence;
+            List<TableHandle> pinned = pinLiveTables();
+            DefaultSnapshot snap = new DefaultSnapshot(
+                    this,
+                    seq,
+                    activeMemTable,
+                    immutableMemTable,
+                    pinned,
+                    diskStorageReader
+            );
+            openSnapshots.add(snap);
+            return snap;
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    void onSnapshotClosed(DefaultSnapshot snapshot) {
+        openSnapshots.remove(snapshot);
+        stateLock.lock();
+        try {
+            cleanObsoleteTables();
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -383,6 +383,13 @@ public final class DefaultStorageEngine implements KVDatabase {
 
         stateLock.lock();
         try {
+            for (DefaultSnapshot snap : List.copyOf(openSnapshots)) {
+                try {
+                    snap.close();
+                } catch (Exception ignored) {}
+            }
+            openSnapshots.clear();
+
             for (ClosableIterator<?> it : List.copyOf(openScans)) {
                 try {
                     it.close();
@@ -481,20 +488,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             }
             updatedWals.add(new WalMeta(newWalId, false));
 
-            ManifestSnapshot nextSnapshot = new ManifestSnapshot(
-                    ++currentEpoch,
-                    nextFileId,
-                    highSequence,
-                    updatedWals,
-                    currentSnapshot.tables()
-            );
-            manifestStore.commit(nextSnapshot);
-            try {
-                storageIO.syncDirectory(directory);
-            } catch (IOException e) {
-                throw new StorageException(ErrorCode.IO, "Failed to sync directory after WAL rotation", e);
-            }
-            maybeCompactManifest(nextSnapshot);
+            commitManifest(updatedWals, currentSnapshot.tables(), "WAL rotation");
 
             immutableMemTable = activeMemTable;
             immutableWalId = activeWalId;
@@ -544,21 +538,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             List<TableMeta> updatedTables = new ArrayList<>(currentSnapshot.tables());
             updatedTables.add(tableMeta);
 
-            ManifestSnapshot nextSnapshot = new ManifestSnapshot(
-                    ++currentEpoch,
-                    nextFileId,
-                    highSequence,
-                    updatedWals,
-                    updatedTables
-            );
-
-            manifestStore.commit(nextSnapshot);
-            try {
-                storageIO.syncDirectory(directory);
-            } catch (IOException e) {
-                throw new StorageException(ErrorCode.IO, "Failed to sync directory after flush commit", e);
-            }
-            maybeCompactManifest(nextSnapshot);
+            commitManifest(updatedWals, updatedTables, "flush commit");
 
             liveTables.add(newTableHandle);
 
@@ -618,10 +598,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                 isCompacting.set(false);
                 return;
             }
-            pinnedInputs = new ArrayList<>(liveTables);
-            for (TableHandle handle : pinnedInputs) {
-                handle.pin();
-            }
+            pinnedInputs = pinLiveTables();
             outputId = nextFileId++;
         } finally {
             stateLock.unlock();
@@ -631,9 +608,7 @@ public final class DefaultStorageEngine implements KVDatabase {
         try {
             compactedMeta = compactor.build(outputId, pinnedInputs, false);
         } catch (Exception e) {
-            for (TableHandle handle : pinnedInputs) {
-                handle.unpin();
-            }
+            unpinTables(pinnedInputs);
             isCompacting.set(false);
             if (e instanceof StorageException se) {
                 throw se;
@@ -647,9 +622,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             try {
                 newTableHandle = DefaultTableHandle.open(storageIO, newSstPath, compactedMeta.get());
             } catch (Exception e) {
-                for (TableHandle handle : pinnedInputs) {
-                    handle.unpin();
-                }
+                unpinTables(pinnedInputs);
                 try {
                     storageIO.deleteIfExists(newSstPath);
                 } catch (IOException ignored) {}
@@ -678,9 +651,7 @@ public final class DefaultStorageEngine implements KVDatabase {
                         storageIO.deleteIfExists(newSstPath);
                     } catch (IOException ignored) {}
                 }
-                for (TableHandle handle : pinnedInputs) {
-                    handle.unpin();
-                }
+                unpinTables(pinnedInputs);
                 return;
             }
 
@@ -693,21 +664,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             }
             compactedMeta.ifPresent(updatedTables::add);
 
-            ManifestSnapshot nextSnapshot = new ManifestSnapshot(
-                    ++currentEpoch,
-                    nextFileId,
-                    highSequence,
-                    currentSnapshot.wals(),
-                    updatedTables
-            );
-
-            manifestStore.commit(nextSnapshot);
-            try {
-                storageIO.syncDirectory(directory);
-            } catch (IOException e) {
-                throw new StorageException(ErrorCode.IO, "Failed to sync directory after compaction commit", e);
-            }
-            maybeCompactManifest(nextSnapshot);
+            commitManifest(currentSnapshot.wals(), updatedTables, "compaction commit");
 
             liveTables.removeIf(t -> compactedTableIds.contains(t.id()));
             if (newTableHandle != null) {
@@ -737,6 +694,23 @@ public final class DefaultStorageEngine implements KVDatabase {
         } finally {
             stateLock.unlock();
         }
+    }
+
+    private void commitManifest(List<WalMeta> wals, List<TableMeta> tables, String context) throws StorageException {
+        ManifestSnapshot nextSnapshot = new ManifestSnapshot(
+                ++currentEpoch,
+                nextFileId,
+                highSequence,
+                wals,
+                tables
+        );
+        manifestStore.commit(nextSnapshot);
+        try {
+            storageIO.syncDirectory(directory);
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.IO, "Failed to sync directory after " + context, e);
+        }
+        maybeCompactManifest(nextSnapshot);
     }
 
     private void maybeCompactManifest(ManifestSnapshot snapshot) throws StorageException {
@@ -785,6 +759,21 @@ public final class DefaultStorageEngine implements KVDatabase {
             }
             return false;
         });
+    }
+
+    private List<TableHandle> pinLiveTables() {
+        List<TableHandle> pinned = new ArrayList<>(liveTables.size());
+        for (TableHandle handle : liveTables) {
+            handle.pin();
+            pinned.add(handle);
+        }
+        return pinned;
+    }
+
+    private static void unpinTables(List<TableHandle> tables) {
+        for (TableHandle handle : tables) {
+            handle.unpin();
+        }
     }
 
     @Override
@@ -875,6 +864,10 @@ public final class DefaultStorageEngine implements KVDatabase {
         return paths;
     }
 
+    void ensureEngineOpen() throws StorageException {
+        ensureOpen();
+    }
+
     private void ensureOpen() throws StorageException {
         StorageException bg = backgroundError.get();
         if (bg != null) {
@@ -908,14 +901,13 @@ public final class DefaultStorageEngine implements KVDatabase {
     }
 
     private final class ScanIterator implements ClosableIterator<Entry> {
-        private final DefaultMergedIterator merged;
-        private final List<TableHandle> pinnedTables;
-        private Entry nextEntry;
+        private final ClosableIterator<Entry> delegate;
+        private final Snapshot snapshot;
         private boolean closed;
 
-        ScanIterator(DefaultMergedIterator merged, List<TableHandle> pinnedTables) {
-            this.merged = merged;
-            this.pinnedTables = pinnedTables;
+        ScanIterator(ClosableIterator<Entry> delegate, Snapshot snapshot) {
+            this.delegate = delegate;
+            this.snapshot = snapshot;
         }
 
         @Override
@@ -923,61 +915,28 @@ public final class DefaultStorageEngine implements KVDatabase {
             if (closed) {
                 return false;
             }
-            if (nextEntry != null) {
-                return true;
-            }
-
-            while (merged.advance()) {
-                InternalRecord rec = merged.current();
-                if (!rec.isTombstone()) {
-                    nextEntry = new Entry(rec.key().bytes(), rec.value(), false);
-                    return true;
-                }
-            }
-            return false;
+            return delegate.hasNext();
         }
 
         @Override
         public synchronized Entry next() throws StorageException {
-            if (!hasNext()) {
-                throw new NoSuchElementException("No more entries in scan");
+            if (closed) {
+                throw new NoSuchElementException("Iterator is closed");
             }
-            Entry entry = nextEntry;
-            nextEntry = null;
-            return entry;
+            return delegate.next();
         }
 
         @Override
         public synchronized void close() throws StorageException {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            openScans.remove(this);
-
-            try {
-                merged.close();
-            } finally {
-                for (TableHandle handle : pinnedTables) {
-                    handle.unpin();
+            if (!closed) {
+                closed = true;
+                openScans.remove(this);
+                try {
+                    delegate.close();
+                } finally {
+                    snapshot.close();
                 }
-                cleanObsoleteTables();
             }
         }
-    }
-
-    private static final class EmptyClosableIterator implements ClosableIterator<Entry> {
-        @Override
-        public boolean hasNext() {
-            return false;
-        }
-
-        @Override
-        public Entry next() {
-            throw new NoSuchElementException("Iterator is empty");
-        }
-
-        @Override
-        public void close() {}
     }
 }
