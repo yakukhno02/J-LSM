@@ -224,6 +224,35 @@ public class SSTablePropertyTest {
                     SSTableDumpOracle.DumpReport report = SSTableDumpOracle.inspectAndValidate(storageIO, compactedPath);
                     assertThat(report.allRecords()).isEqualTo(expectedLive);
                 }
+
+                // Also verify split compaction (buildSplit) preserves 100% of live records across disjoint partitions
+                java.util.concurrent.atomic.AtomicLong splitNextId = new java.util.concurrent.atomic.AtomicLong(compactedId + 1);
+                List<TableMeta> splitMetas = compactor.buildSplit(
+                        splitNextId::getAndIncrement,
+                        handles,
+                        false,
+                        4500L // force splitting whenever output exceeds 1 data block
+                );
+                if (expectedLive.isEmpty()) {
+                    assertThat(splitMetas).isEmpty();
+                } else {
+                    assertThat(splitMetas).isNotEmpty();
+                    List<InternalRecord> combinedSplitRecords = new ArrayList<>();
+                    ByteKey prevLastKey = null;
+                    for (TableMeta splitMeta : splitMetas) {
+                        Path splitPath = flusher.sstPath(splitMeta.tableId());
+                        SSTableDumpOracle.DumpReport splitReport = SSTableDumpOracle.inspectAndValidate(storageIO, splitPath);
+                        assertThat(splitReport.allRecords()).isNotEmpty();
+                        ByteKey firstKey = splitReport.allRecords().get(0).key();
+                        ByteKey lastKey = splitReport.allRecords().get(splitReport.allRecords().size() - 1).key();
+                        if (prevLastKey != null) {
+                            assertThat(prevLastKey.compareTo(firstKey)).isLessThan(0);
+                        }
+                        prevLastKey = lastKey;
+                        combinedSplitRecords.addAll(splitReport.allRecords());
+                    }
+                    assertThat(combinedSplitRecords).isEqualTo(expectedLive);
+                }
             } finally {
                 for (TableHandle h : handles) {
                     h.close();

@@ -291,6 +291,131 @@ class DefaultCompactorTest {
                 .isInstanceOfSatisfying(StorageException.class, e -> assertThat(e.code()).isEqualTo(ErrorCode.CLOSED));
     }
 
+    @Test
+    @DisplayName("buildSplit partitions K-way merged output into multiple SSTables bounded by targetFileSizeBytes")
+    void testBuildSplitProducesMultipleSizeBoundedSSTables() throws Exception {
+        List<InternalRecord> batch1 = new ArrayList<>();
+        List<InternalRecord> batch2 = new ArrayList<>();
+        for (int i = 0; i < 300; i++) {
+            String k = String.format("split-key-%05d", i);
+            batch1.add(put(k, "initial-payload-value-for-splitting-" + i, 100L + i));
+            if (i % 3 == 0) {
+                batch2.add(put(k, "updated-payload-value-for-splitting-" + i, 1000L + i));
+            } else if (i % 10 == 0) {
+                batch2.add(del(k, 1000L + i));
+            }
+        }
+
+        TableMeta m1 = flusher.build(1L, new ListCursor(batch1));
+        TableMeta m2 = flusher.build(2L, new ListCursor(batch2));
+
+        try (DefaultTableHandle h1 = DefaultTableHandle.open(storageIO, flusher.sstPath(1L), m1);
+             DefaultTableHandle h2 = DefaultTableHandle.open(storageIO, flusher.sstPath(2L), m2)) {
+
+            long targetFileSize = 8500L; // ~2 data blocks (2 * 4096 + header + bloom + index + footer)
+            java.util.concurrent.atomic.AtomicLong nextId = new java.util.concurrent.atomic.AtomicLong(100L);
+
+            List<TableMeta> splitMetas = compactor.buildSplit(
+                    nextId::getAndIncrement,
+                    List.of(h1, h2),
+                    false,
+                    targetFileSize
+            );
+
+            assertThat(splitMetas).hasSizeGreaterThanOrEqualTo(3);
+
+            long totalRecords = 0L;
+            List<InternalRecord> allSplitRecords = new ArrayList<>();
+            ByteKey previousPartitionLastKey = null;
+
+            for (TableMeta meta : splitMetas) {
+                assertThat(meta.fileSize()).isLessThanOrEqualTo(targetFileSize);
+                assertThat(meta.recordCount()).isGreaterThan(0L);
+                totalRecords += meta.recordCount();
+
+                try (DefaultTableHandle partHandle = DefaultTableHandle.open(storageIO, flusher.sstPath(meta.tableId()), meta);
+                     RecordCursor cursor = partHandle.scan(null, null)) {
+                    ByteKey firstKeyInPart = null;
+                    ByteKey lastKeyInPart = null;
+                    while (cursor.advance()) {
+                        InternalRecord rec = cursor.current();
+                        if (firstKeyInPart == null) {
+                            firstKeyInPart = rec.key();
+                        }
+                        lastKeyInPart = rec.key();
+                        allSplitRecords.add(rec);
+                    }
+                    assertThat(firstKeyInPart).isNotNull();
+                    if (previousPartitionLastKey != null) {
+                        // Disjoint, strictly increasing key ranges across partitions
+                        assertThat(previousPartitionLastKey.compareTo(firstKeyInPart)).isLessThan(0);
+                    }
+                    previousPartitionLastKey = lastKeyInPart;
+                }
+            }
+
+            // Compare concatenated records from split tables against single-output compaction
+            Optional<TableMeta> singleMetaOpt = compactor.build(500L, List.of(h1, h2), false);
+            assertThat(singleMetaOpt).isPresent();
+            assertThat(totalRecords).isEqualTo(singleMetaOpt.get().recordCount());
+
+            List<InternalRecord> singleRecords = new ArrayList<>();
+            try (DefaultTableHandle singleHandle = DefaultTableHandle.open(storageIO, flusher.sstPath(500L), singleMetaOpt.get());
+                 RecordCursor cursor = singleHandle.scan(null, null)) {
+                while (cursor.advance()) {
+                    singleRecords.add(cursor.current());
+                }
+            }
+
+            assertThat(allSplitRecords).isEqualTo(singleRecords);
+        }
+    }
+
+    @Test
+    @DisplayName("buildSplit returns empty list when all records are annihilated by tombstones or inputs are empty")
+    void testBuildSplitEmptyAndAnnihilated() throws Exception {
+        java.util.concurrent.atomic.AtomicLong nextId = new java.util.concurrent.atomic.AtomicLong(200L);
+        assertThat(compactor.buildSplit(nextId::getAndIncrement, List.of(), false, 8192L)).isEmpty();
+        assertThat(nextId.get()).isEqualTo(200L);
+
+        TableMeta m1 = flusher.build(1L, new ListCursor(List.of(put("k1", "v1", 1L))));
+        TableMeta m2 = flusher.build(2L, new ListCursor(List.of(del("k1", 5L))));
+
+        try (DefaultTableHandle h1 = DefaultTableHandle.open(storageIO, flusher.sstPath(1L), m1);
+             DefaultTableHandle h2 = DefaultTableHandle.open(storageIO, flusher.sstPath(2L), m2)) {
+            List<TableMeta> res = compactor.buildSplit(nextId::getAndIncrement, List.of(h1, h2), false, 8192L);
+            assertThat(res).isEmpty();
+            assertThat(nextId.get()).isEqualTo(200L);
+        }
+    }
+
+    @Test
+    @DisplayName("buildSplit cleans up already-produced partition files if a later partition fails I/O")
+    void testBuildSplitCleansUpPreviousPartitionsOnMidStreamFailure() throws Exception {
+        List<InternalRecord> batch = new ArrayList<>();
+        for (int i = 0; i < 160; i++) {
+            batch.add(put(String.format("key-%04d", i), "payload-value-for-failure-test-" + i, i + 1L));
+        }
+        TableMeta m1 = flusher.build(1L, new ListCursor(batch));
+
+        FaultInjectingStorage faultStorage = new FaultInjectingStorage(storageIO);
+        DefaultCompactor faultCompactor = new DefaultCompactor(tempDir, faultStorage, 4500L);
+
+        try (DefaultTableHandle h1 = DefaultTableHandle.open(storageIO, flusher.sstPath(1L), m1)) {
+            // Allow first partition (~4.2KB) to succeed, fail during second partition write
+            faultStorage.failAfterBytesWritten(6000L);
+            java.util.concurrent.atomic.AtomicLong nextId = new java.util.concurrent.atomic.AtomicLong(300L);
+
+            assertThatThrownBy(() -> faultCompactor.buildSplit(nextId::getAndIncrement, List.of(h1), false))
+                    .isInstanceOf(StorageException.class);
+
+            // Both the completed first partition (300.sst) and any temporary second partition (301.sst.tmp) must be cleaned up
+            assertThat(Files.exists(flusher.sstPath(300L))).isFalse();
+            assertThat(Files.exists(flusher.sstPath(301L))).isFalse();
+            assertThat(Files.exists(flusher.tmpPath(301L))).isFalse();
+        }
+    }
+
     private static final class ListCursor implements RecordCursor {
         private final Iterator<InternalRecord> it;
         private InternalRecord cur;
