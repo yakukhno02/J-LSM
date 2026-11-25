@@ -19,12 +19,21 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
 
     @Override
     public Optional<InternalRecord> search(List<TableHandle> pinnedTables, ByteKey key) throws StorageException {
+        return search(pinnedTables, key, Long.MAX_VALUE);
+    }
+
+    @Override
+    public Optional<InternalRecord> search(List<TableHandle> pinnedTables, ByteKey key, long maxSequence) throws StorageException {
         Objects.requireNonNull(pinnedTables, "pinnedTables cannot be null");
         Objects.requireNonNull(key, "key cannot be null");
 
         InternalRecord best = null;
 
         for (TableHandle handle : pinnedTables) {
+            // Prune search if SSTable was written strictly after maxSequence
+            if (handle.minSequence() > maxSequence) {
+                continue;
+            }
             // Prune search if this SSTable's maxSequence cannot beat our current best record
             if (best != null && handle.maxSequence() <= best.sequence()) {
                 continue;
@@ -34,8 +43,10 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
 
             if (candidate.isPresent()) {
                 InternalRecord record = candidate.get();
-                if (best == null || record.sequence() > best.sequence()) {
-                    best = record;
+                if (record.sequence() <= maxSequence) {
+                    if (best == null || record.sequence() > best.sequence()) {
+                        best = record;
+                    }
                 }
             }
         }
@@ -45,6 +56,11 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
 
     @Override
     public RecordCursor scanDisk(List<TableHandle> pinnedTables, ByteKey fromKey, ByteKey toKey) throws StorageException {
+        return scanDisk(pinnedTables, fromKey, toKey, Long.MAX_VALUE);
+    }
+
+    @Override
+    public RecordCursor scanDisk(List<TableHandle> pinnedTables, ByteKey fromKey, ByteKey toKey, long maxSequence) throws StorageException {
         Objects.requireNonNull(pinnedTables, "pinnedTables cannot be null");
 
         if (fromKey != null && toKey != null && fromKey.compareTo(toKey) > 0) {
@@ -53,11 +69,53 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
 
         List<RecordCursor> cursors = new ArrayList<>(pinnedTables.size());
         for (TableHandle handle : pinnedTables) {
-            cursors.add(handle.scan(fromKey, toKey));
+            if (handle.minSequence() > maxSequence) {
+                continue;
+            }
+            RecordCursor rawCursor = handle.scan(fromKey, toKey);
+            cursors.add(new SequenceFilterRecordCursor(rawCursor, maxSequence));
         }
 
         // In disk scan, tombstones are filtered out (retainTombstones = false)
         return new DefaultMergedIterator(cursors, false);
+    }
+
+    private static final class SequenceFilterRecordCursor implements RecordCursor {
+        private final RecordCursor delegate;
+        private final long maxSequence;
+        private InternalRecord currentRecord;
+
+        private SequenceFilterRecordCursor(RecordCursor delegate, long maxSequence) {
+            this.delegate = delegate;
+            this.maxSequence = maxSequence;
+        }
+
+        @Override
+        public boolean advance() throws StorageException {
+            while (delegate.advance()) {
+                InternalRecord rec = delegate.current();
+                if (rec.sequence() <= maxSequence) {
+                    this.currentRecord = rec;
+                    return true;
+                }
+            }
+            this.currentRecord = null;
+            return false;
+        }
+
+        @Override
+        public InternalRecord current() {
+            if (currentRecord == null) {
+                throw new IllegalStateException("Cursor current() called before advance() or after EOF");
+            }
+            return currentRecord;
+        }
+
+        @Override
+        public void close() throws StorageException {
+            delegate.close();
+            currentRecord = null;
+        }
     }
 
     private static final class EmptyRecordCursor implements RecordCursor {

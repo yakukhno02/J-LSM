@@ -4,11 +4,15 @@ import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordCursor;
 
-import java.util.Iterator;
-import java.util.Objects;
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableSet;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -17,6 +21,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Concurrent, sorted in-memory representation of entries backed by a {@link ConcurrentSkipListMap}.
  * Keys are ordered lexicographically by their unsigned byte values via {@link ByteKey#compareTo(ByteKey)}.
+ * Maintains historical versions for point-in-time snapshot reads.
  */
 public final class DefaultMemTable implements MemTable {
 
@@ -24,11 +29,13 @@ public final class DefaultMemTable implements MemTable {
     private static final int ENTRY_OVERHEAD_BYTES = 32;
 
     private final ConcurrentSkipListMap<ByteKey, InternalRecord> map;
+    private final ConcurrentSkipListMap<InternalKey, InternalRecord> historyMap;
     private final AtomicLong byteSize;
     private final Set<Long> attachedWalIds;
 
     public DefaultMemTable() {
         this.map = new ConcurrentSkipListMap<>();
+        this.historyMap = new ConcurrentSkipListMap<>();
         this.byteSize = new AtomicLong(0L);
         this.attachedWalIds = ConcurrentHashMap.newKeySet();
     }
@@ -43,6 +50,7 @@ public final class DefaultMemTable implements MemTable {
 
         long deltaBytes;
         if (oldRecord != null) {
+            historyMap.put(new InternalKey(key, oldRecord.sequence()), oldRecord);
             long oldBytes = calculateRecordBytes(key, oldRecord);
             deltaBytes = recordBytes - oldBytes;
         } else {
@@ -59,23 +67,56 @@ public final class DefaultMemTable implements MemTable {
     }
 
     @Override
-    public RecordCursor scan(ByteKey fromKey, ByteKey toKey) {
-        ConcurrentNavigableMap<ByteKey, InternalRecord> view;
-
-        if (fromKey == null && toKey == null) {
-            view = map;
-        } else if (fromKey == null) {
-            view = map.headMap(toKey, false);
-        } else if (toKey == null) {
-            view = map.tailMap(fromKey, true);
-        } else {
-            if (fromKey.compareTo(toKey) > 0) {
-                return new EmptyRecordCursor();
-            }
-            view = map.subMap(fromKey, true, toKey, false);
+    public Optional<InternalRecord> get(ByteKey key, long maxSequence) {
+        Objects.requireNonNull(key, "key cannot be null");
+        InternalRecord latest = map.get(key);
+        if (latest != null && latest.sequence() <= maxSequence) {
+            return Optional.of(latest);
         }
 
-        return new MemTableRecordCursor(new ArrayList<>(view.values()).iterator());
+        // Latest record is newer than maxSequence or absent; search history
+        Map.Entry<InternalKey, InternalRecord> entry =
+                historyMap.ceilingEntry(new InternalKey(key, maxSequence));
+        if (entry != null && entry.getKey().key().equals(key)) {
+            return Optional.of(entry.getValue());
+        }
+
+        return Optional.empty();
+    }
+
+    @Override
+    public RecordCursor scan(ByteKey fromKey, ByteKey toKey) {
+        return scan(fromKey, toKey, Long.MAX_VALUE);
+    }
+
+    @Override
+    public RecordCursor scan(ByteKey fromKey, ByteKey toKey, long maxSequence) {
+        if (fromKey != null && toKey != null && fromKey.compareTo(toKey) > 0) {
+            return new EmptyRecordCursor();
+        }
+
+        ConcurrentNavigableMap<ByteKey, InternalRecord> keyView = rangeView(map, fromKey, toKey);
+
+        if (maxSequence == Long.MAX_VALUE && historyMap.isEmpty()) {
+            return new MemTableRecordCursor(new ArrayList<>(keyView.values()).iterator());
+        }
+
+        NavigableSet<ByteKey> allKeys = new TreeSet<>(keyView.keySet());
+
+        if (!historyMap.isEmpty()) {
+            InternalKey historyFrom = fromKey != null ? new InternalKey(fromKey, Long.MAX_VALUE) : null;
+            InternalKey historyTo = toKey != null ? new InternalKey(toKey, Long.MAX_VALUE) : null;
+            for (InternalKey ik : rangeView(historyMap, historyFrom, historyTo).keySet()) {
+                allKeys.add(ik.key());
+            }
+        }
+
+        List<InternalRecord> result = new ArrayList<>();
+        for (ByteKey k : allKeys) {
+            get(k, maxSequence).ifPresent(result::add);
+        }
+
+        return new MemTableRecordCursor(result.iterator());
     }
 
     @Override
@@ -91,6 +132,7 @@ public final class DefaultMemTable implements MemTable {
     @Override
     public void clear() {
         map.clear();
+        historyMap.clear();
         byteSize.set(0L);
         attachedWalIds.clear();
     }
@@ -105,10 +147,35 @@ public final class DefaultMemTable implements MemTable {
         return Set.copyOf(attachedWalIds);
     }
 
+    private static <K, V> ConcurrentNavigableMap<K, V> rangeView(
+            ConcurrentNavigableMap<K, V> navMap, K from, K to) {
+        if (from == null && to == null) {
+            return navMap;
+        } else if (from == null) {
+            return navMap.headMap(to, false);
+        } else if (to == null) {
+            return navMap.tailMap(from, true);
+        } else {
+            return navMap.subMap(from, true, to, false);
+        }
+    }
+
     private static long calculateRecordBytes(ByteKey key, InternalRecord record) {
         byte[] val = record.value();
-        int valLength = (val != null) ? val.length : 0;
-        return ENTRY_OVERHEAD_BYTES + (long) key.length() + valLength;
+        int valLen = (val != null) ? val.length : 0;
+        return ENTRY_OVERHEAD_BYTES + (long) key.length() + valLen;
+    }
+
+    private record InternalKey(ByteKey key, long sequence) implements Comparable<InternalKey> {
+        @Override
+        public int compareTo(InternalKey other) {
+            int cmp = this.key.compareTo(other.key);
+            if (cmp != 0) {
+                return cmp;
+            }
+            // Descending by sequence number
+            return Long.compare(other.sequence, this.sequence);
+        }
     }
 
     private static final class MemTableRecordCursor implements RecordCursor {

@@ -8,9 +8,17 @@ import java.util.List;
 import java.util.Optional;
 
 public interface DiskStorageReader {
-    // Точковий пошук по списку відкритих таблиць. Перемагає запис з максимальним sequence!
+    // Point lookup across pinned SSTables. Entry with highest sequence wins.
     Optional<InternalRecord> search(List<TableHandle> pinnedTables, ByteKey key) throws StorageException;
 
-    // Діапазонний скан по диску з K-way злиттям і дедуплікацією версій
+    default Optional<InternalRecord> search(List<TableHandle> pinnedTables, ByteKey key, long maxSequence) throws StorageException {
+        return search(pinnedTables, key);
+    }
+
+    // Range scan across disk with K-way merge and version deduplication.
     RecordCursor scanDisk(List<TableHandle> pinnedTables, ByteKey fromKey, ByteKey toKey) throws StorageException;
+
+    default RecordCursor scanDisk(List<TableHandle> pinnedTables, ByteKey fromKey, ByteKey toKey, long maxSequence) throws StorageException {
+        return scanDisk(pinnedTables, fromKey, toKey);
+    }
 }
