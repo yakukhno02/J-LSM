@@ -105,5 +105,24 @@ class SparseIndexTest {
         byte[] returned = meta.firstKey();
         returned[0] = 77;
         assertThat(meta.firstKey()[0]).isEqualTo((byte) 1);
+
+        BlockMeta same = new BlockMeta(0L, 4096, new byte[]{1, 2, 3});
+        BlockMeta diffOffset = new BlockMeta(4096L, 4096, new byte[]{1, 2, 3});
+        BlockMeta diffSize = new BlockMeta(0L, 8192, new byte[]{1, 2, 3});
+        BlockMeta diffKey = new BlockMeta(0L, 4096, new byte[]{9, 9, 9});
+
+        assertThat(meta).isEqualTo(meta);
+        assertThat(meta).isEqualTo(same);
+        assertThat(meta.hashCode()).isEqualTo(same.hashCode());
+        assertThat(meta).isNotEqualTo(null);
+        assertThat(meta).isNotEqualTo("str");
+        assertThat(meta).isNotEqualTo(diffOffset);
+        assertThat(meta).isNotEqualTo(diffSize);
+        assertThat(meta).isNotEqualTo(diffKey);
+        assertThat(meta.hashCode()).isNotEqualTo(diffOffset.hashCode());
+        assertThat(meta.toString()).contains("BlockMeta[offset=0, size=4096, firstKeyLen=3]");
+
+        assertThatThrownBy(() -> new BlockMeta(-1L, 4096, new byte[]{1})).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new BlockMeta(0L, 0, new byte[]{1})).isInstanceOf(IllegalArgumentException.class);
     }
 }

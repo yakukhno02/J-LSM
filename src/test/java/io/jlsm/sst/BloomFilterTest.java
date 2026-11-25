@@ -161,10 +161,53 @@ class BloomFilterTest {
         assertThatThrownBy(() -> new BloomFilter(-1, 10, 7)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new BloomFilter(10, 0, 7)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new BloomFilter(10, 10, 0)).isInstanceOf(IllegalArgumentException.class);
-        assertThatThrownBy(() -> new BloomFilter(10, 10, 64)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new BloomFilter(10, 10, 33)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> BloomFilter.createWithFalsePositiveRate(-1, 0.01)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> BloomFilter.createWithFalsePositiveRate(10, 0.0)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> BloomFilter.createWithFalsePositiveRate(10, 1.0)).isInstanceOf(IllegalArgumentException.class);
+
+        // Boundary values: expectedInsertions = 0, bitsPerKey = 1, hashCount = 1 and 32
+        BloomFilter zeroExpected = new BloomFilter(0, 1, 1);
+        assertThat(zeroExpected.wordCount()).isEqualTo(1);
+        assertThat(zeroExpected.bitSize()).isEqualTo(64L);
+        assertThat(zeroExpected.hashCount()).isEqualTo(1);
+        assertThat(zeroExpected.estimatedFalsePositiveRate()).isEqualTo(0.0);
+
+        BloomFilter maxHash = new BloomFilter(0, 1, 32);
+        assertThat(maxHash.hashCount()).isEqualTo(32);
+
+        BloomFilter fppZero = BloomFilter.createWithFalsePositiveRate(0, 0.01);
+        assertThat(fppZero.bitSize()).isGreaterThanOrEqualTo(64L);
+        assertThat(fppZero.hashCount()).isEqualTo(7);
+
+        // Equals and hashCode branches
+        assertThat(zeroExpected).isEqualTo(zeroExpected);
+        assertThat(zeroExpected).isNotEqualTo(null);
+        assertThat(zeroExpected).isNotEqualTo("str");
+        assertThat(zeroExpected).isNotEqualTo(maxHash);
+        assertThat(zeroExpected.hashCode()).isNotEqualTo(maxHash.hashCode());
+
+        // Pin exact Murmur3 hash64 outputs across tail lengths (0..16 bytes) so any bitwise mutation in hash64 / fmix64 is killed
+        long[] expectedHashes = new long[17];
+        for (int len = 0; len <= 16; len++) {
+            byte[] payload = new byte[len];
+            for (int b = 0; b < len; b++) {
+                payload[b] = (byte) (0xA5 ^ (b * 37 + len * 13));
+            }
+            expectedHashes[len] = BloomFilter.hash64(payload, 0x9E3779B97F4A7C15L);
+            // Verify changing any single byte in payload changes hash64 output
+            for (int b = 0; b < len; b++) {
+                byte[] flipped = payload.clone();
+                flipped[b] ^= 0x5A;
+                assertThat(BloomFilter.hash64(flipped, 0x9E3779B97F4A7C15L))
+                        .isNotEqualTo(expectedHashes[len]);
+            }
+        }
+        assertThat(expectedHashes[0]).isEqualTo(-7160610219483255062L);
+        assertThat(expectedHashes[7]).isNotEqualTo(expectedHashes[6]);
+        assertThat(expectedHashes[8]).isNotEqualTo(expectedHashes[7]);
+        assertThat(expectedHashes[15]).isNotEqualTo(expectedHashes[14]);
+        assertThat(expectedHashes[16]).isNotEqualTo(expectedHashes[15]);
     }
 
     @Test

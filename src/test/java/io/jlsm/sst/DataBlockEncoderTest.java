@@ -139,4 +139,37 @@ class DataBlockEncoderTest {
         assertThat(encoder.usedBytes()).isEqualTo(8);
         assertThat(encoder.firstKey()).isNull();
     }
+
+    @Test
+    @DisplayName("FinishedBlock validates arguments, defensive copies, equals, and hashCode")
+    void testFinishedBlockEqualsHashCodeAndValidation() {
+        DataBlockEncoder encoder = new DataBlockEncoder();
+        encoder.append(1L, RecordKind.PUT, "k1".getBytes(StandardCharsets.UTF_8), "v1".getBytes(StandardCharsets.UTF_8));
+        FinishedBlock b1 = encoder.finishBlock();
+        FinishedBlock b2 = new FinishedBlock(b1.blockBytes(), b1.firstKey(), b1.recordCount());
+        FinishedBlock bDiffCount = new FinishedBlock(b1.blockBytes(), b1.firstKey(), 2);
+        FinishedBlock bDiffKey = new FinishedBlock(b1.blockBytes(), "k2".getBytes(StandardCharsets.UTF_8), b1.recordCount());
+        byte[] modBytes = b1.blockBytes();
+        modBytes[10] ^= 0x01;
+        FinishedBlock bDiffBytes = new FinishedBlock(modBytes, b1.firstKey(), b1.recordCount());
+
+        assertThat(b1).isEqualTo(b1);
+        assertThat(b1).isEqualTo(b2);
+        assertThat(b1.hashCode()).isEqualTo(b2.hashCode());
+        assertThat(b1).isNotEqualTo(null);
+        assertThat(b1).isNotEqualTo("not-a-block");
+        assertThat(b1).isNotEqualTo(bDiffCount);
+        assertThat(b1).isNotEqualTo(bDiffKey);
+        assertThat(b1).isNotEqualTo(bDiffBytes);
+        assertThat(b1.hashCode()).isNotEqualTo(bDiffCount.hashCode());
+
+        assertThatThrownBy(() -> new FinishedBlock(new byte[100], new byte[]{1}, 1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new FinishedBlock(new byte[4096], new byte[]{1}, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        assertThat(encoder.canFit(5000, 0)).isFalse();
+        assertThat(encoder.canFit(-1, 0)).isFalse();
+        assertThat(encoder.canFit(0, -1)).isFalse();
+    }
 }
