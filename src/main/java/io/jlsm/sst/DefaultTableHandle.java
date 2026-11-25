@@ -28,6 +28,7 @@ public final class DefaultTableHandle implements TableHandle {
     private final SSTableHeader header;
     private final Footer footer;
     private final SparseIndex sparseIndex;
+    private final BloomFilter bloomFilter;
     private final long minSequence;
     private final long maxSequence;
     private final long fileSize;
@@ -39,6 +40,7 @@ public final class DefaultTableHandle implements TableHandle {
             SSTableHeader header,
             Footer footer,
             SparseIndex sparseIndex,
+            BloomFilter bloomFilter,
             long minSequence,
             long maxSequence,
             long fileSize
@@ -47,6 +49,7 @@ public final class DefaultTableHandle implements TableHandle {
         this.header = header;
         this.footer = footer;
         this.sparseIndex = sparseIndex;
+        this.bloomFilter = bloomFilter;
         this.minSequence = minSequence;
         this.maxSequence = maxSequence;
         this.fileSize = fileSize;
@@ -117,14 +120,28 @@ public final class DefaultTableHandle implements TableHandle {
         Footer footer = Footer.decode(footerBuf);
 
         // 3. Validate index offsets from footer
-        if (footer.indexOffset() < SSTableHeader.HEADER_SIZE
+        long dataEndOffset = SSTableHeader.HEADER_SIZE + (long) footer.blockCount() * header.blockSize();
+        if (footer.indexOffset() < dataEndOffset
                 || footer.indexOffset() + footer.indexLength() > size - Footer.FOOTER_SIZE) {
             throw new StorageException(ErrorCode.CORRUPTION,
                     "Invalid index bounds in footer: offset " + footer.indexOffset()
                             + ", length " + footer.indexLength() + ", file size " + size);
         }
 
-        // 4. Read and decode Sparse Index
+        // 4. Read and decode optional Bloom Filter Block between Data Blocks and Sparse Index
+        BloomFilter bloomFilter = null;
+        if (footer.indexOffset() > dataEndOffset) {
+            long bloomLength = footer.indexOffset() - dataEndOffset;
+            if (bloomLength > Integer.MAX_VALUE) {
+                throw new StorageException(ErrorCode.CORRUPTION, "Invalid BloomFilter block length: " + bloomLength);
+            }
+            ByteBuffer bloomBuf = ByteBuffer.allocate((int) bloomLength).order(ByteOrder.BIG_ENDIAN);
+            readFully(channel, bloomBuf, dataEndOffset);
+            bloomBuf.flip();
+            bloomFilter = BloomFilter.decode(bloomBuf);
+        }
+
+        // 5. Read and decode Sparse Index
         ByteBuffer indexBuf = ByteBuffer.allocate((int) footer.indexLength()).order(ByteOrder.BIG_ENDIAN);
         readFully(channel, indexBuf, footer.indexOffset());
         indexBuf.flip();
@@ -139,7 +156,7 @@ public final class DefaultTableHandle implements TableHandle {
         long minSeq = meta != null ? meta.minSeq() : 0L;
         long maxSeq = meta != null ? meta.maxSeq() : Long.MAX_VALUE;
 
-        return new DefaultTableHandle(channel, header, footer, sparseIndex, minSeq, maxSeq, size);
+        return new DefaultTableHandle(channel, header, footer, sparseIndex, bloomFilter, minSeq, maxSeq, size);
     }
 
     @Override
@@ -179,8 +196,21 @@ public final class DefaultTableHandle implements TableHandle {
         return sparseIndex;
     }
 
+    public BloomFilter bloomFilter() {
+        return bloomFilter;
+    }
+
     public ChannelIO channel() {
         return channel;
+    }
+
+    @Override
+    public boolean mightContain(ByteKey key) {
+        Objects.requireNonNull(key, "key cannot be null");
+        if (bloomFilter == null) {
+            return true;
+        }
+        return bloomFilter.mightContain(key);
     }
 
     public void pin() {
@@ -203,11 +233,16 @@ public final class DefaultTableHandle implements TableHandle {
     }
 
     /**
-     * Performs an efficient point search in this SSTable for the given key using binary search on SparseIndex.
+     * Performs an efficient point search in this SSTable for the given key using BloomFilter pruning
+     * followed by binary search on SparseIndex.
      */
     public Optional<InternalRecord> get(ByteKey key) throws StorageException {
         Objects.requireNonNull(key, "key cannot be null");
         ensureOpen();
+
+        if (bloomFilter != null && !bloomFilter.mightContain(key)) {
+            return Optional.empty();
+        }
 
         List<BlockMeta> blocks = sparseIndex.blocks();
         if (blocks.isEmpty()) {
