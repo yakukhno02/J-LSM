@@ -101,16 +101,26 @@ public final class SSTableDumpOracle {
             footerBuf.flip();
             Footer footer = Footer.decode(footerBuf);
 
-            long expectedIndexOffset = SSTableHeader.HEADER_SIZE
+            long dataBlocksEndOffset = SSTableHeader.HEADER_SIZE
                     + (long) footer.blockCount() * DataBlockEncoder.BLOCK_SIZE;
-            if (footer.indexOffset() != expectedIndexOffset) {
+            if (footer.indexOffset() < dataBlocksEndOffset) {
                 throw new StorageException(ErrorCode.CORRUPTION,
                         "Footer indexOffset (" + footer.indexOffset()
-                                + ") does not match expected offset after data blocks (" + expectedIndexOffset + ")");
+                                + ") is smaller than end of data blocks (" + dataBlocksEndOffset + ")");
             }
             if (footer.indexOffset() + footer.indexLength() != fileSize - Footer.FOOTER_SIZE) {
                 throw new StorageException(ErrorCode.CORRUPTION,
                         "Footer indexOffset + indexLength does not align with start of Footer");
+            }
+
+            // 2b. Validate optional Bloom Filter Block between Data Blocks and Sparse Index
+            io.jlsm.sst.BloomFilter bloomFilter = null;
+            if (footer.indexOffset() > dataBlocksEndOffset) {
+                int bloomLen = (int) (footer.indexOffset() - dataBlocksEndOffset);
+                ByteBuffer bloomBuf = ByteBuffer.allocate(bloomLen).order(ByteOrder.BIG_ENDIAN);
+                readFully(channel, bloomBuf, dataBlocksEndOffset);
+                bloomBuf.flip();
+                bloomFilter = io.jlsm.sst.BloomFilter.decode(bloomBuf);
             }
 
             // 3. Validate SparseIndex
@@ -184,11 +194,15 @@ public final class SSTableDumpOracle {
                             "Block " + i + " first record key does not match SparseIndex firstKey");
                 }
 
-                // Verify global ascending key order across all records
+                // Verify global ascending key order across all records and BloomFilter membership
                 for (InternalRecord record : records) {
                     if (prevRecordKey != null && prevRecordKey.compareTo(record.key()) > 0) {
                         throw new StorageException(ErrorCode.CORRUPTION,
                                 "Out-of-order key detected in data block " + i);
+                    }
+                    if (bloomFilter != null && !bloomFilter.mightContain(record.key())) {
+                        throw new StorageException(ErrorCode.CORRUPTION,
+                                "BloomFilter false negative detected for key in data block " + i);
                     }
                     prevRecordKey = record.key();
                     allRecords.add(record);

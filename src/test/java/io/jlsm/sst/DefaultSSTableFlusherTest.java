@@ -65,7 +65,8 @@ class DefaultSSTableFlusherTest {
                 )
         );
 
-        TableMeta meta = flusher.build(1L, new ListRecordCursor(records));
+        DefaultSSTableFlusher legacyFlusher = new DefaultSSTableFlusher(tempDir, standardStorage, false);
+        TableMeta meta = legacyFlusher.build(1L, new ListRecordCursor(records));
 
         assertThat(meta.tableId()).isEqualTo(1L);
         assertThat(meta.minSeq()).isEqualTo(1L);
