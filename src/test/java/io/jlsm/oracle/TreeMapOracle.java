@@ -12,35 +12,25 @@ import java.util.Objects;
 import java.util.TreeMap;
 
 /**
- * In-memory reference oracle backed by {@link TreeMap} (Section 6.1.1 of DESIGN.md).
- * Maintains exact key-value state sorted by {@link ByteKey} (unsigned lexicographical byte order)
- * to verify J-LSM operations, range scans, and compaction invariants.
+ * In-memory reference oracle backed by {@link TreeMap} for verifying J-LSM invariants.
  */
 public final class TreeMapOracle {
 
     private final NavigableMap<ByteKey, InternalRecord> state = new TreeMap<>();
     private long nextSequence = 0L;
 
-    /**
-     * Applies a PUT operation with an auto-incremented sequence number.
-     */
     public InternalRecord put(byte[] key, byte[] value) {
         Objects.requireNonNull(key, "key cannot be null");
         Objects.requireNonNull(value, "value cannot be null");
         return apply(InternalRecord.of(ByteKey.copyOf(key), value.clone(), RecordKind.PUT, ++nextSequence));
     }
 
-    /**
-     * Applies a DELETE operation with an auto-incremented sequence number.
-     */
     public InternalRecord delete(byte[] key) {
         Objects.requireNonNull(key, "key cannot be null");
         return apply(InternalRecord.of(ByteKey.copyOf(key), null, RecordKind.DELETE, ++nextSequence));
     }
 
-    /**
-     * Applies an {@link InternalRecord} if its sequence number is newer than any existing record for the same key.
-     */
+    // Overwrites only if the new record has a higher or equal sequence number
     public InternalRecord apply(InternalRecord record) {
         Objects.requireNonNull(record, "record cannot be null");
         if (record.sequence() > nextSequence) {
@@ -55,9 +45,6 @@ public final class TreeMapOracle {
         return record;
     }
 
-    /**
-     * Point lookup returning the live value for {@code key}, or {@code null} if absent or deleted.
-     */
     public byte[] get(byte[] key) {
         Objects.requireNonNull(key, "key cannot be null");
         InternalRecord rec = state.get(ByteKey.copyOf(key));
@@ -67,16 +54,10 @@ public final class TreeMapOracle {
         return rec.value();
     }
 
-    /**
-     * Returns the raw latest {@link InternalRecord} (including tombstones) for {@code key}, or {@code null} if never written.
-     */
     public InternalRecord getRaw(ByteKey key) {
         return state.get(Objects.requireNonNull(key, "key cannot be null"));
     }
 
-    /**
-     * Performs a range scan over {@code [fromKey, toKey)} returning live {@link Entry} items.
-     */
     public List<Entry> scan(byte[] fromKey, byte[] toKey) {
         ByteKey from = fromKey != null ? ByteKey.copyOf(fromKey) : null;
         ByteKey to = toKey != null ? ByteKey.copyOf(toKey) : null;
@@ -105,11 +86,7 @@ public final class TreeMapOracle {
         return result;
     }
 
-    /**
-     * Returns all surviving records expected after a full compaction.
-     *
-     * @param retainTombstones if false, tombstones are omitted; if true, tombstones are included
-     */
+    // Simulates surviving records after compaction (optionally retaining tombstones)
     public List<InternalRecord> expectedCompactedRecords(boolean retainTombstones) {
         List<InternalRecord> result = new ArrayList<>();
         for (InternalRecord rec : state.values()) {
@@ -118,6 +95,13 @@ public final class TreeMapOracle {
             }
         }
         return result;
+    }
+
+    public TreeMapOracle snapshot() {
+        TreeMapOracle copy = new TreeMapOracle();
+        copy.state.putAll(this.state);
+        copy.nextSequence = this.nextSequence;
+        return copy;
     }
 
     public void clear() {
