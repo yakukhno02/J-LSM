@@ -28,10 +28,25 @@ public final class DefaultSSTableFlusher implements SSTableFlusher {
 
     private final Path baseDir;
     private final StorageIO storageIO;
+    private final boolean bloomFilterEnabled;
+    private final int bloomBitsPerKey;
 
     public DefaultSSTableFlusher(Path baseDir, StorageIO storageIO) {
+        this(baseDir, storageIO, true, BloomFilter.DEFAULT_BITS_PER_KEY);
+    }
+
+    public DefaultSSTableFlusher(Path baseDir, StorageIO storageIO, boolean bloomFilterEnabled) {
+        this(baseDir, storageIO, bloomFilterEnabled, BloomFilter.DEFAULT_BITS_PER_KEY);
+    }
+
+    public DefaultSSTableFlusher(Path baseDir, StorageIO storageIO, boolean bloomFilterEnabled, int bloomBitsPerKey) {
         this.baseDir = Objects.requireNonNull(baseDir, "baseDir cannot be null");
         this.storageIO = Objects.requireNonNull(storageIO, "storageIO cannot be null");
+        if (bloomBitsPerKey <= 0) {
+            throw new IllegalArgumentException("bloomBitsPerKey must be positive: " + bloomBitsPerKey);
+        }
+        this.bloomFilterEnabled = bloomFilterEnabled;
+        this.bloomBitsPerKey = bloomBitsPerKey;
     }
 
     public Path sstPath(long fileId) {
@@ -76,6 +91,7 @@ public final class DefaultSSTableFlusher implements SSTableFlusher {
             // 2. Iterate through sorted entries and encode 4KB data blocks
             DataBlockEncoder encoder = new DataBlockEncoder();
             List<BlockMeta> blockIndex = new ArrayList<>();
+            List<byte[]> bloomKeys = bloomFilterEnabled ? new ArrayList<>() : null;
             byte[] lastKey = null;
 
             while (sortedEntries.advance()) {
@@ -92,6 +108,10 @@ public final class DefaultSSTableFlusher implements SSTableFlusher {
                     throw new IllegalArgumentException("RecordCursor entries are not sorted in ascending order");
                 }
                 lastKey = keyBytes;
+
+                if (bloomKeys != null) {
+                    bloomKeys.add(keyBytes);
+                }
 
                 long seq = record.sequence();
                 if (seq < minSeq) minSeq = seq;
@@ -126,14 +146,25 @@ public final class DefaultSSTableFlusher implements SSTableFlusher {
                 maxSeq = 0L;
             }
 
-            // 3. Write Sparse Index
+            // 3. Write Bloom Filter Block (between Data Blocks and Sparse Index) when enabled and non-empty
+            if (bloomKeys != null && !bloomKeys.isEmpty()) {
+                BloomFilter bloomFilter = new BloomFilter(bloomKeys.size(), bloomBitsPerKey, BloomFilter.DEFAULT_HASH_COUNT);
+                for (byte[] keyBytes : bloomKeys) {
+                    bloomFilter.add(keyBytes);
+                }
+                byte[] bloomBytes = bloomFilter.encode();
+                writeFully(channel, ByteBuffer.wrap(bloomBytes), currentOffset);
+                currentOffset += bloomBytes.length;
+            }
+
+            // 4. Write Sparse Index
             long indexOffset = currentOffset;
             byte[] indexBytes = SparseIndex.encode(blockIndex);
             writeFully(channel, ByteBuffer.wrap(indexBytes), currentOffset);
             currentOffset += indexBytes.length;
             long indexLength = indexBytes.length;
 
-            // 4. Write Footer (40 bytes)
+            // 5. Write Footer (40 bytes)
             Footer footer = new Footer(indexOffset, indexLength, totalRecordCount, blockIndex.size(), Footer.CURRENT_VERSION);
             byte[] footerBytes = footer.encode();
             writeFully(channel, ByteBuffer.wrap(footerBytes), currentOffset);

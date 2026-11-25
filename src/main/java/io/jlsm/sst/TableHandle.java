@@ -21,6 +21,10 @@ public interface TableHandle extends AutoCloseable {
     Optional<InternalRecord> get(ByteKey key) throws StorageException;
     RecordCursor scan(ByteKey fromKey, ByteKey toKey) throws StorageException;
 
+    default boolean mightContain(ByteKey key) {
+        return true;
+    }
+
     @Override
     void close();
 }

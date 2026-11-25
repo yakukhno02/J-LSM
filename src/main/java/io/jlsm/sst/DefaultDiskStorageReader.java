@@ -38,6 +38,10 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
             if (best != null && handle.maxSequence() <= best.sequence()) {
                 continue;
             }
+            // Check per-SSTable Bloom Filter before performing SparseIndex binary search or 4KB disk block read
+            if (!handle.mightContain(key)) {
+                continue;
+            }
 
             Optional<InternalRecord> candidate = handle.get(key);
 

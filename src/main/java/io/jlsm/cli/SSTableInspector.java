@@ -7,6 +7,7 @@ import io.jlsm.internal.io.StandardStorageIO;
 import io.jlsm.internal.io.StorageIO;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.sst.BlockMeta;
+import io.jlsm.sst.BloomFilter;
 import io.jlsm.sst.DataBlockDecoder;
 import io.jlsm.sst.DataBlockEncoder;
 import io.jlsm.sst.Footer;
@@ -61,6 +62,16 @@ public final class SSTableInspector {
             indexBuf.flip();
             SparseIndex sparseIndex = SparseIndex.decode(indexBuf);
 
+            long dataEndOffset = SSTableHeader.HEADER_SIZE + (long) footer.blockCount() * header.blockSize();
+            BloomFilter bloomFilter = null;
+            if (footer.indexOffset() > dataEndOffset) {
+                int bloomLen = (int) (footer.indexOffset() - dataEndOffset);
+                ByteBuffer bloomBuf = ByteBuffer.allocate(bloomLen).order(ByteOrder.BIG_ENDIAN);
+                readFully(channel, bloomBuf, dataEndOffset);
+                bloomBuf.flip();
+                bloomFilter = BloomFilter.decode(bloomBuf);
+            }
+
             out.println("================================================================================");
             out.println("                           SSTABLE BINARY STRUCTURE DUMP                        ");
             out.println("================================================================================");
@@ -71,6 +82,11 @@ public final class SSTableInspector {
             out.printf("  Footer [%d..%d] : Magic=0x%08X (JLSM), Version=%d, Blocks=%d, TotalRecords=%d%n",
                     fileSize - Footer.FOOTER_SIZE, fileSize - 1,
                     Footer.FOOTER_MAGIC, footer.formatVersion(), footer.blockCount(), footer.totalRecordCount());
+            if (bloomFilter != null) {
+                out.printf("  Bloom Filter      : Offset=%d, Length=%d bytes, Bits=%d, k=%d, Fill=%.1f%%%n",
+                        dataEndOffset, footer.indexOffset() - dataEndOffset,
+                        bloomFilter.bitSize(), bloomFilter.hashCount(), bloomFilter.fillRatio() * 100.0);
+            }
             out.printf("  Sparse Index      : Offset=%d, Length=%d bytes, Entries=%d%n",
                     footer.indexOffset(), footer.indexLength(), sparseIndex.blocks().size());
             out.println("--------------------------------------------------------------------------------");
