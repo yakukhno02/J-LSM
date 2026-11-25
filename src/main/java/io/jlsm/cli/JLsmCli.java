@@ -5,8 +5,10 @@ import io.jlsm.api.DatabaseOptions;
 import io.jlsm.api.DurabilityMode;
 import io.jlsm.api.Entry;
 import io.jlsm.api.KVDatabase;
+import io.jlsm.api.Snapshot;
 import io.jlsm.api.StorageException;
 import io.jlsm.api.StorageMetrics;
+import io.jlsm.api.WriteBatch;
 import io.jlsm.engine.IntegrityReport;
 import io.jlsm.engine.StorageBackupManager;
 import io.jlsm.engine.StorageDiagnostics;
@@ -221,6 +223,63 @@ public final class JLsmCli {
                 double elapsedUs = (System.nanoTime() - t0) / 1000.0;
                 out.printf(Locale.US, "OK [tombstone written] (%.1f us)%n", elapsedUs);
             }
+            case "batch" -> {
+                if (tokens.size() < 2) {
+                    out.println("Usage: batch <put:key=val | del:key> ...");
+                    return;
+                }
+                long t0 = System.nanoTime();
+                try (WriteBatch batch = WriteBatch.create()) {
+                    for (int i = 1; i < tokens.size(); i++) {
+                        String spec = tokens.get(i);
+                        if (spec.startsWith("put:")) {
+                            int eq = spec.indexOf('=', 4);
+                            if (eq <= 4) {
+                                out.println("Invalid batch put specification: " + spec + " (expected put:key=value)");
+                                return;
+                            }
+                            String k = spec.substring(4, eq);
+                            String v = spec.substring(eq + 1);
+                            batch.put(bytes(k), bytes(v));
+                        } else if (spec.startsWith("del:")) {
+                            String k = spec.substring(4);
+                            if (k.isEmpty()) {
+                                out.println("Invalid batch delete specification: " + spec + " (expected del:key)");
+                                return;
+                            }
+                            batch.delete(bytes(k));
+                        } else {
+                            out.println("Unknown batch operation: " + spec + " (use put:key=val or del:key)");
+                            return;
+                        }
+                    }
+                    int opCount = batch.operationCount();
+                    long byteSize = batch.byteSize();
+                    db.write(batch);
+                    double elapsedUs = (System.nanoTime() - t0) / 1000.0;
+                    out.printf(Locale.US, "OK [Atomic WriteBatch committed: %d ops, %d B] (%.1f us)%n",
+                            opCount, byteSize, elapsedUs);
+                }
+            }
+            case "snapshot-scan", "snap" -> {
+                byte[] fromKey = (tokens.size() > 1 && !"*".equals(tokens.get(1))) ? bytes(tokens.get(1)) : null;
+                byte[] toKey = (tokens.size() > 2 && !"*".equals(tokens.get(2))) ? bytes(tokens.get(2)) : null;
+                long t0 = System.nanoTime();
+                int count = 0;
+                try (Snapshot snap = db.snapshot();
+                     ClosableIterator<Entry> it = snap.scan(fromKey, toKey)) {
+                    out.printf(Locale.US, "  [Snapshot seq=%d opened]%n", snap.sequenceNumber());
+                    while (it.hasNext()) {
+                        Entry e = it.next();
+                        out.printf("  [%d] \"%s\" => \"%s\"%n",
+                                ++count,
+                                new String(e.key(), StandardCharsets.UTF_8),
+                                new String(e.value(), StandardCharsets.UTF_8));
+                    }
+                }
+                double elapsedUs = (System.nanoTime() - t0) / 1000.0;
+                out.printf(Locale.US, "(%d snapshot entries scanned in %.1f us)%n", count, elapsedUs);
+            }
             case "scan" -> {
                 byte[] fromKey = (tokens.size() > 1 && !"*".equals(tokens.get(1))) ? bytes(tokens.get(1)) : null;
                 byte[] toKey = (tokens.size() > 2 && !"*".equals(tokens.get(2))) ? bytes(tokens.get(2)) : null;
@@ -346,7 +405,24 @@ public final class JLsmCli {
             Thread.sleep(100L);
             printMetricsDashboard(db.metrics(), out);
 
-            out.println("\n[Step 3] Executing Range Scan [\"metric:001\", \"metric:006\") across MemTable + SSTables...");
+            out.println("\n[Step 3] Executing Atomic WriteBatch (0x03) & Consistent Read Snapshot isolation (M8)...");
+            try (WriteBatch batch = WriteBatch.create()) {
+                batch.put(bytes("batch:1"), bytes("atomic-val-1"))
+                     .put(bytes("batch:2"), bytes("atomic-val-2"))
+                     .delete(bytes("user:1001"));
+                db.write(batch);
+                out.printf("  Committed Atomic WriteBatch (%d operations)%n", batch.operationCount());
+            }
+            try (Snapshot snap = db.snapshot()) {
+                long snapSeq = snap.sequenceNumber();
+                db.put(bytes("batch:1"), bytes("mutated-after-snapshot"));
+                String snapVal = new String(snap.get(bytes("batch:1")), StandardCharsets.UTF_8);
+                String liveVal = new String(db.get(bytes("batch:1")), StandardCharsets.UTF_8);
+                out.printf("  Snapshot [seq=%d] get(\"batch:1\") -> \"%s\" (isolated from live update \"%s\")%n",
+                        snapSeq, snapVal, liveVal);
+            }
+
+            out.println("\n[Step 3b] Executing Range Scan [\"metric:001\", \"metric:006\") across MemTable + SSTables...");
             try (ClosableIterator<Entry> it = db.scan(bytes("metric:001"), bytes("metric:006"))) {
                 while (it.hasNext()) {
                     Entry e = it.next();
@@ -443,16 +519,18 @@ public final class JLsmCli {
         out.println("  put <key> <value>              Insert or update a key-value pair");
         out.println("  get <key>                      Retrieve value by key");
         out.println("  delete <key> (or del <key>)    Mark key as deleted (Tombstone)");
+        out.println("  batch <put:k=v|del:k> ...      Commit an atomic WriteBatch (WAL frame 0x03)");
+        out.println("  snap [fromKey|*] [toKey|*]     Point-in-time Snapshot range scan");
         out.println("  scan [fromKey|*] [toKey|*]     Range scan [fromKey, toKey) in unsigned byte order");
         out.println("  sync                           Force active WAL fsync to disk");
         out.println("  metrics (or stats)             Show real-time memory, disk, and operation telemetry");
         out.println("  inspect (or diag)              Verify MANIFEST, SSTables, WALs, and disk usage");
-        out.println("  dump-sst <file.sst>            Inspect 4KB Data Blocks, Sparse Index, Header & Footer");
+        out.println("  dump-sst <file.sst>            Inspect 4KB Data Blocks, Bloom Filter, Sparse Index & Footer");
         out.println("  backup <backupDir>             Create an online hot backup of the database");
         out.println("  verify-backup <backupDir>      Verify CRC32 integrity of a backup directory");
         out.println("  restore <backupDir> <target>   Restore a verified backup to a target directory");
         out.println("  benchmark [count] [valBytes]   Run M7 throughput & latency benchmark suite");
-        out.println("  demo                           Run guided M7 architecture & crash-recovery showcase");
+        out.println("  demo                           Run guided M7/M8 architecture & crash-recovery showcase");
         out.println("  help                           Display this command reference");
         out.println("  exit (or quit)                 Close database cleanly and exit");
         out.println();

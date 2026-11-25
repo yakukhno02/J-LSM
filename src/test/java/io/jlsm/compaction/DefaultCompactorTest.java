@@ -416,6 +416,37 @@ class DefaultCompactorTest {
         }
     }
 
+    @Test
+    @DisplayName("Compactor interface default buildSplit delegates to build and validates arguments")
+    void testCompactorDefaultBuildSplitAndAccessors() throws Exception {
+        assertThat(compactor.defaultTargetFileSizeBytes()).isEqualTo(Compactor.DEFAULT_TARGET_FILE_SIZE);
+        assertThatThrownBy(() -> new DefaultCompactor(tempDir, storageIO, 0L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> compactor.buildSplit(null, List.of(), false, 4096L))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> compactor.buildSplit(() -> 1L, null, false, 4096L))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> compactor.buildSplit(() -> 1L, List.of(), false, 0L))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        TableMeta expectedMeta = new TableMeta(99L, 1L, 5L, 2L, 4200L);
+        Compactor customCompactor = (outputId, pinnedInputs, retainTombstones) -> Optional.of(expectedMeta);
+
+        assertThatThrownBy(() -> customCompactor.buildSplit(null, List.of(), false, 4096L))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> customCompactor.buildSplit(() -> 99L, null, false, 4096L))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> customCompactor.buildSplit(() -> 99L, List.of(), false, 0L))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThat(customCompactor.buildSplit(() -> 99L, List.of(), false, 4096L)).isEmpty();
+
+        TableMeta m1 = flusher.build(1L, new ListCursor(List.of(put("k1", "v1", 1L))));
+        try (DefaultTableHandle h1 = DefaultTableHandle.open(storageIO, flusher.sstPath(1L), m1)) {
+            List<TableMeta> res = customCompactor.buildSplit(() -> 99L, List.of(h1), false, 4096L);
+            assertThat(res).containsExactly(expectedMeta);
+        }
+    }
+
     private static final class ListCursor implements RecordCursor {
         private final Iterator<InternalRecord> it;
         private InternalRecord cur;

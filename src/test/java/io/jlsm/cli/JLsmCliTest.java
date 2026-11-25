@@ -38,6 +38,10 @@ class JLsmCliTest {
                 "get unknown",
                 "delete user:3",
                 "get user:3",
+                "batch put:b1=val1 put:b2=val2 del:user:2",
+                "get b1",
+                "get user:2",
+                "snap b1 b9",
                 "scan user:1 user:9",
                 "scan",
                 "sync",
@@ -63,8 +67,9 @@ class JLsmCliTest {
                 .contains("\"Alice Admin\"")
                 .contains("(nil)")
                 .contains("OK [tombstone written]")
+                .contains("OK [Atomic WriteBatch committed: 3 ops")
+                .contains("[Snapshot seq=")
                 .contains("\"user:1\" => \"Alice Admin\"")
-                .contains("\"user:2\" => \"Bob Builder\"")
                 .contains("OK [WAL synced to disk]")
                 .contains("J-LSM REAL-TIME TELEMETRY")
                 .contains("J-LSM STORAGE DIAGNOSTICS REPORT")

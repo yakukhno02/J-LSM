@@ -186,6 +186,21 @@ class DefaultTableHandleTest {
                 });
     }
 
+    @Test
+    @DisplayName("Accessors header(), footer(), sparseIndex(), and mightContain() return expected metadata")
+    void testAccessorsAndDefaultTableHandleMethods() throws Exception {
+        TableMeta meta = flusher.build(30L, new ListCursor(List.of(put("k1", "v1", 5L))));
+        try (DefaultTableHandle handle = DefaultTableHandle.open(storageIO, flusher.sstPath(30L), meta)) {
+            assertThat(handle.header()).isNotNull();
+            assertThat(handle.header().fileId()).isEqualTo(30L);
+            assertThat(handle.footer()).isNotNull();
+            assertThat(handle.footer().totalRecordCount()).isEqualTo(1L);
+            assertThat(handle.sparseIndex()).isNotNull();
+            assertThat(handle.sparseIndex().blocks()).hasSize(1);
+            assertThat(handle.mightContain(key("k1"))).isTrue();
+        }
+    }
+
     private static final class ListCursor implements RecordCursor {
         private final Iterator<InternalRecord> it;
         private InternalRecord cur;

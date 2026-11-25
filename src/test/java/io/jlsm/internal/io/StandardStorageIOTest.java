@@ -191,4 +191,37 @@ class StandardStorageIOTest {
         assertThatThrownBy(() -> channel.force(false))
                 .isInstanceOf(IOException.class);
     }
+
+    @Test
+    @DisplayName("Creates missing parent directories automatically and exposes FileChannelIO and FileLockHandle accessors")
+    void testMissingParentDirectoriesAndAccessors() throws IOException {
+        Path nestedFile = tempDir.resolve("nested/dir/a/file.bin");
+        try (ChannelIO ch = storage.createNew(nestedFile)) {
+            assertThat(ch).isInstanceOf(FileChannelIO.class);
+            FileChannelIO fcio = (FileChannelIO) ch;
+            assertThat(fcio.path()).isEqualTo(nestedFile);
+            assertThat(fcio.fileChannel()).isNotNull();
+            assertThat(fcio.fileChannel().isOpen()).isTrue();
+            fcio.write(ByteBuffer.wrap(new byte[]{1, 2, 3}), 0L);
+            fcio.truncate(0L);
+            assertThat(fcio.size()).isZero();
+        }
+
+        Path nestedRw = tempDir.resolve("nested/dir/b/rw.bin");
+        try (ChannelIO ch = storage.openReadWrite(nestedRw)) {
+            ch.write(ByteBuffer.wrap(new byte[]{42}), 0L);
+        }
+
+        Path nestedTarget = tempDir.resolve("nested/dir/c/moved.bin");
+        storage.atomicMove(nestedRw, nestedTarget);
+        assertThat(Files.exists(nestedTarget)).isTrue();
+
+        Path nestedLock = tempDir.resolve("nested/dir/d/LOCK");
+        try (LockHandle lh = storage.acquireLock(nestedLock)) {
+            assertThat(lh).isInstanceOf(FileLockHandle.class);
+            FileLockHandle flh = (FileLockHandle) lh;
+            assertThat(flh.fileLock()).isNotNull();
+            assertThat(flh.fileLock().isValid()).isTrue();
+        }
+    }
 }

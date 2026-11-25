@@ -83,9 +83,12 @@ public final class SSTableInspector {
                     fileSize - Footer.FOOTER_SIZE, fileSize - 1,
                     Footer.FOOTER_MAGIC, footer.formatVersion(), footer.blockCount(), footer.totalRecordCount());
             if (bloomFilter != null) {
-                out.printf("  Bloom Filter      : Offset=%d, Length=%d bytes, Bits=%d, k=%d, Fill=%.1f%%%n",
+                out.printf(java.util.Locale.US,
+                        "  Bloom Filter      : Offset=%d, Length=%d bytes, Bits=%d, k=%d, Fill=%.1f%%, EstFPP=%.4f%%%n",
                         dataEndOffset, footer.indexOffset() - dataEndOffset,
-                        bloomFilter.bitSize(), bloomFilter.hashCount(), bloomFilter.fillRatio() * 100.0);
+                        bloomFilter.bitSize(), bloomFilter.hashCount(),
+                        bloomFilter.fillRatio() * 100.0,
+                        bloomFilter.estimatedFalsePositiveRate() * 100.0);
             }
             out.printf("  Sparse Index      : Offset=%d, Length=%d bytes, Entries=%d%n",
                     footer.indexOffset(), footer.indexLength(), sparseIndex.blocks().size());

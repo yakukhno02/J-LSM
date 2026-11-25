@@ -232,6 +232,43 @@ class SizeTieredCompactionPlannerTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new CompactionPlan(List.of(stubTable(1L, 1L, 2L, 1L, 100L)), 4096L, false, true, -1))
                 .isInstanceOf(IllegalArgumentException.class);
+
+        SizeTieredCompactionPlanner defaultPlanner = new SizeTieredCompactionPlanner();
+        assertThat(defaultPlanner.minTablesPerTier()).isEqualTo(SizeTieredCompactionPlanner.DEFAULT_MIN_TABLES);
+        assertThat(defaultPlanner.maxTablesPerTier()).isEqualTo(SizeTieredCompactionPlanner.DEFAULT_MAX_TABLES);
+        assertThat(defaultPlanner.targetFileSizeBytes()).isEqualTo(Compactor.DEFAULT_TARGET_FILE_SIZE);
+        assertThat(defaultPlanner.buildContiguousSizeBuckets(List.of())).isEmpty();
+    }
+
+    @Test
+    @DisplayName("isHigherPriority prefers bucket with more tables, then smaller total bytes, then earlier startIndex")
+    void testMultiBucketPriorityTieBreaking() {
+        SizeTieredCompactionPlanner planner = new SizeTieredCompactionPlanner(
+                2, 4, 512L * 1024, 1024L, 0.7, 1.3);
+
+        // Bucket 0: 2 tables of ~100KB each (total 200KB)
+        TableHandle b0_t1 = stubTable(1L, 1L, 10L, 10L, 100_000L);
+        TableHandle b0_t2 = stubTable(2L, 11L, 20L, 10L, 100_000L);
+        // Bucket 1: 3 tables of ~500KB each -> should win by table count (3 > 2)
+        TableHandle b1_t1 = stubTable(3L, 21L, 30L, 50L, 500_000L);
+        TableHandle b1_t2 = stubTable(4L, 31L, 40L, 50L, 500_000L);
+        TableHandle b1_t3 = stubTable(5L, 41L, 50L, 50L, 500_000L);
+
+        Optional<CompactionPlan> planByCount = planner.plan(List.of(b0_t1, b0_t2, b1_t1, b1_t2, b1_t3));
+        assertThat(planByCount).isPresent();
+        assertThat(planByCount.get().selectedTables()).containsExactly(b1_t1, b1_t2, b1_t3);
+
+        // Tie in table count (2 vs 2): prefer smaller total bytes (Bucket 1 has 20KB each vs Bucket 0 has 100KB each)
+        TableHandle s1 = stubTable(6L, 51L, 60L, 5L, 20_000L);
+        TableHandle s2 = stubTable(7L, 61L, 70L, 5L, 20_000L);
+        Optional<CompactionPlan> planByBytes = planner.plan(List.of(b0_t1, b0_t2, s1, s2));
+        assertThat(planByBytes).isPresent();
+        assertThat(planByBytes.get().selectedTables()).containsExactly(s1, s2);
+
+        // Chronological sorting when input list is unordered
+        Optional<CompactionPlan> unorderedPlan = planner.plan(List.of(s2, b0_t2, s1, b0_t1));
+        assertThat(unorderedPlan).isPresent();
+        assertThat(unorderedPlan.get().selectedTables()).containsExactly(s1, s2);
     }
 
     private static InternalRecord put(String key, String val, long seq) {

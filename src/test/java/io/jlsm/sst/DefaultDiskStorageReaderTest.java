@@ -199,6 +199,81 @@ class DefaultDiskStorageReaderTest {
         }
     }
 
+    @Test
+    @DisplayName("Snapshot maxSequence filtering in search and scanDisk respects exact sequence boundaries")
+    void testMaxSequenceFilteringInSearchAndScanDisk() throws Exception {
+        // Table 1 (seqs 10..20): a@10="a1", b@20="b1"
+        TableMeta m1 = flusher.build(1L, new ListCursor(List.of(
+                put("a", "a1", 10L),
+                put("b", "b1", 20L)
+        )));
+        // Table 2 (seqs 30..40): a@30="a2", c@40="c1"
+        TableMeta m2 = flusher.build(2L, new ListCursor(List.of(
+                put("a", "a2", 30L),
+                put("c", "c1", 40L)
+        )));
+        // Table 3 (seqs 50..60): b@50=DELETE, d@60="d1"
+        TableMeta m3 = flusher.build(3L, new ListCursor(List.of(
+                del("b", 50L),
+                put("d", "d1", 60L)
+        )));
+
+        try (DefaultTableHandle h1 = DefaultTableHandle.open(storageIO, flusher.sstPath(1L), m1);
+             DefaultTableHandle h2 = DefaultTableHandle.open(storageIO, flusher.sstPath(2L), m2);
+             DefaultTableHandle h3 = DefaultTableHandle.open(storageIO, flusher.sstPath(3L), m3)) {
+
+            List<TableHandle> tables = List.of(h1, h2, h3);
+
+            // 1. maxSequence = 5 (before all tables -> minSequence > 5 skips all tables)
+            assertThat(reader.search(tables, key("a"), 5L)).isEmpty();
+            try (RecordCursor c = reader.scanDisk(tables, null, null, 5L)) {
+                assertThat(c.advance()).isFalse();
+                assertThat(c.advance()).isFalse();
+            }
+
+            // 2. maxSequence = 10 (exact boundary: table 1 minSequence == 10 is included, b@20 is excluded)
+            Optional<InternalRecord> aAt10 = reader.search(tables, key("a"), 10L);
+            assertThat(aAt10).isPresent();
+            assertThat(aAt10.get().sequence()).isEqualTo(10L);
+            assertThat(reader.search(tables, key("b"), 10L)).isEmpty();
+
+            // 3. maxSequence = 30 (table 1 fully <= 30, table 2 partially <= 30: a@30 included, c@40 excluded)
+            Optional<InternalRecord> aAt30 = reader.search(tables, key("a"), 30L);
+            assertThat(aAt30).isPresent();
+            assertThat(aAt30.get().sequence()).isEqualTo(30L);
+            assertThat(reader.search(tables, key("c"), 30L)).isEmpty();
+
+            List<InternalRecord> scannedAt30 = new ArrayList<>();
+            try (RecordCursor c = reader.scanDisk(tables, null, null, 30L)) {
+                while (c.advance()) {
+                    scannedAt30.add(c.current());
+                }
+            }
+            assertThat(scannedAt30).extracting(InternalRecord::key)
+                    .containsExactly(key("a"), key("b"));
+            assertThat(scannedAt30.get(0).sequence()).isEqualTo(30L);
+            assertThat(scannedAt30.get(1).sequence()).isEqualTo(20L);
+
+            // 4. Custom DiskStorageReader interface default methods delegation
+            DiskStorageReader customReader = new DiskStorageReader() {
+                @Override
+                public Optional<InternalRecord> search(List<TableHandle> pinned, ByteKey k) throws io.jlsm.api.StorageException {
+                    return reader.search(pinned, k);
+                }
+                @Override
+                public RecordCursor scanDisk(List<TableHandle> pinned, ByteKey from, ByteKey to) throws io.jlsm.api.StorageException {
+                    return reader.scanDisk(pinned, from, to);
+                }
+            };
+            // 5. Inverted range fromKey > toKey returns EmptyRecordCursor
+            try (RecordCursor emptyRange = reader.scanDisk(tables, key("z"), key("a"))) {
+                assertThat(emptyRange.advance()).isFalse();
+                org.assertj.core.api.Assertions.assertThatThrownBy(emptyRange::current)
+                        .isInstanceOf(IllegalStateException.class);
+            }
+        }
+    }
+
     private static final class ListCursor implements RecordCursor {
         private final Iterator<InternalRecord> it;
         private InternalRecord cur;
