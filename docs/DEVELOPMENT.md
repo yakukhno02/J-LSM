@@ -78,7 +78,7 @@ flowchart TD
 | **I/O Abstraction** | `io.jlsm.internal.io` | **Dev 2** | `java.nio.channels` | Інтерфейси `StorageIO`, `ChannelIO`, `FaultInjectingStorage` |
 | **Shared Model** | `io.jlsm.internal.model` | **Спільно** | Немає | `ByteKey`, `InternalRecord`, `RecordKind`, `KeyRange` |
 | **MemTable** | `io.jlsm.mem` | **Dev 1** | `internal.model` | Швидка сортована пам'ять, snapshot копії для scan |
-| **WriteBatch** | `io.jlsm.api`, `engine` | **Dev 1** | `wal`, `mem` | Атомарний пакетний запис (all-or-nothing, Scope Extension) |
+| **WriteBatch & Snapshots** | `io.jlsm.api`, `engine`, `mem` | **Dev 1** | `wal`, `mem`, `sst` | Атомарний пакетний запис (WriteBatch) та консистентні знімки (Snapshot, Scope Extension) |
 | **WAL Engine** | `io.jlsm.wal` | **Dev 1** | `internal.io`, `model` | Серіалізація кадрів, перевірка CRC32, tail recovery |
 | **Manifest Store** | `io.jlsm.manifest` | **Dev 1** | `internal.io` | Журнал стану (Catalog), атомарний commit add/remove |
 | **SSTable Codecs** | `io.jlsm.sst` | **Dev 2** | `internal.io`, `model` | Блоки 4 КБ, `SparseIndex`, `Footer`, `TableHandle`, `BloomFilter` (Scope Extension) |
@@ -826,7 +826,7 @@ gantt
 ### Етап 6: Scope Extension та фінальний захист (M8 — M9)
 
 * **Віха M8 (Scope Extension — добір до ≥ 3 000 core LOC на людину):**
-  * **Dev 1:** Атомарні пакети запису `WriteBatch` (інтерфейс, бінарний кадр WAL 0x03 BATCH, все-або-нічого відновлення, тест стійкості R-03 та property-тест P-06).
+  * **Dev 1:** Атомарні пакети запису `WriteBatch` (інтерфейс, бінарний кадр WAL 0x03 BATCH, все-або-нічого відновлення, тест стійкості R-03 та property-тест P-06) та консистентні знімки `Consistent Read Snapshots` (інтерфейс `Snapshot`, ізоляція на рівні фіксованого sequence number, версіонування в `DefaultMemTable`, закріплення SSTables через ref-counting, property-тест P-08).
   * **Dev 2:** Фільтри Блума для SSTable (`BloomFilter`, хешування, інтеграція в точковий пошук, тест P-07) та розширений `Compactor` з розбиттям вихідного потоку на таблиці фіксованого розміру (SSTable Splitting / Size-Tiered злиття з поверненням `List<TableMeta>`).
 * **Віха M9:** Фінальний прогін мутаційного тестування **Pitest (≥ 80%)**, лінійне покриття **≥ 90%**, аудит обсягу коду ядра (разом ≥ 6 000 LOC на команду) та захист проєкту.
 
