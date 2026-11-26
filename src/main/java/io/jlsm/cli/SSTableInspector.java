@@ -10,6 +10,7 @@ import io.jlsm.sst.BlockMeta;
 import io.jlsm.sst.BloomFilter;
 import io.jlsm.sst.DataBlockDecoder;
 import io.jlsm.sst.DataBlockEncoder;
+import io.jlsm.sst.DefaultTableHandle;
 import io.jlsm.sst.Footer;
 import io.jlsm.sst.SSTableHeader;
 import io.jlsm.sst.SparseIndex;
@@ -40,37 +41,25 @@ public final class SSTableInspector {
         Objects.requireNonNull(sstFile, "sstFile cannot be null");
         Objects.requireNonNull(out, "out cannot be null");
 
-        try (ChannelIO channel = storageIO.openRead(sstFile)) {
-            long fileSize = channel.size();
-            if (fileSize < SSTableHeader.HEADER_SIZE + Footer.FOOTER_SIZE) {
-                throw new StorageException(ErrorCode.CORRUPTION,
-                        "File is too small to be a valid SSTable (" + fileSize + " bytes): " + sstFile);
-            }
+        long initialSize;
+        try (ChannelIO ch = storageIO.openRead(sstFile)) {
+            initialSize = ch.size();
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.IO, "Failed to inspect SSTable file size: " + sstFile, e);
+        }
+        if (initialSize < SSTableHeader.HEADER_SIZE + Footer.FOOTER_SIZE) {
+            throw new StorageException(ErrorCode.CORRUPTION,
+                    "File is too small to be a valid SSTable (" + initialSize + " bytes): " + sstFile);
+        }
 
-            ByteBuffer headerBuf = ByteBuffer.allocate(SSTableHeader.HEADER_SIZE).order(ByteOrder.BIG_ENDIAN);
-            readFully(channel, headerBuf, 0L);
-            headerBuf.flip();
-            SSTableHeader header = SSTableHeader.decode(headerBuf);
-
-            ByteBuffer footerBuf = ByteBuffer.allocate(Footer.FOOTER_SIZE).order(ByteOrder.BIG_ENDIAN);
-            readFully(channel, footerBuf, fileSize - Footer.FOOTER_SIZE);
-            footerBuf.flip();
-            Footer footer = Footer.decode(footerBuf);
-
-            ByteBuffer indexBuf = ByteBuffer.allocate((int) footer.indexLength()).order(ByteOrder.BIG_ENDIAN);
-            readFully(channel, indexBuf, footer.indexOffset());
-            indexBuf.flip();
-            SparseIndex sparseIndex = SparseIndex.decode(indexBuf);
-
+        try (DefaultTableHandle handle = DefaultTableHandle.open(storageIO, sstFile)) {
+            ChannelIO channel = handle.channel();
+            long fileSize = handle.fileSize();
+            SSTableHeader header = handle.header();
+            Footer footer = handle.footer();
+            SparseIndex sparseIndex = handle.sparseIndex();
+            BloomFilter bloomFilter = handle.bloomFilter();
             long dataEndOffset = SSTableHeader.HEADER_SIZE + (long) footer.blockCount() * header.blockSize();
-            BloomFilter bloomFilter = null;
-            if (footer.indexOffset() > dataEndOffset) {
-                int bloomLen = (int) (footer.indexOffset() - dataEndOffset);
-                ByteBuffer bloomBuf = ByteBuffer.allocate(bloomLen).order(ByteOrder.BIG_ENDIAN);
-                readFully(channel, bloomBuf, dataEndOffset);
-                bloomBuf.flip();
-                bloomFilter = BloomFilter.decode(bloomBuf);
-            }
 
             out.println("================================================================================");
             out.println("                           SSTABLE BINARY STRUCTURE DUMP                        ");

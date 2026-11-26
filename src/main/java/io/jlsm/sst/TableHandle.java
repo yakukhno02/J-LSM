@@ -25,6 +25,14 @@ public interface TableHandle extends AutoCloseable {
         return true;
     }
 
+    default Optional<ByteKey> firstKey() {
+        return Optional.empty();
+    }
+
+    default Optional<ByteKey> lastKey() {
+        return Optional.empty();
+    }
+
     @Override
     void close();
 }

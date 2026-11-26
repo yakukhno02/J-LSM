@@ -34,6 +34,7 @@ public final class DefaultTableHandle implements TableHandle {
     private final long fileSize;
     private final AtomicInteger refCount = new AtomicInteger(1);
     private volatile boolean closed;
+    private volatile ByteKey cachedLastKey;
 
     private DefaultTableHandle(
             ChannelIO channel,
@@ -108,16 +109,10 @@ public final class DefaultTableHandle implements TableHandle {
         }
 
         // 1. Read and decode 32-byte Common Header
-        ByteBuffer headerBuf = ByteBuffer.allocate(SSTableHeader.HEADER_SIZE).order(ByteOrder.BIG_ENDIAN);
-        readFully(channel, headerBuf, 0L);
-        headerBuf.flip();
-        SSTableHeader header = SSTableHeader.decode(headerBuf);
+        SSTableHeader header = SSTableHeader.decode(readBuffer(channel, 0L, SSTableHeader.HEADER_SIZE));
 
         // 2. Read and decode 40-byte Footer
-        ByteBuffer footerBuf = ByteBuffer.allocate(Footer.FOOTER_SIZE).order(ByteOrder.BIG_ENDIAN);
-        readFully(channel, footerBuf, size - Footer.FOOTER_SIZE);
-        footerBuf.flip();
-        Footer footer = Footer.decode(footerBuf);
+        Footer footer = Footer.decode(readBuffer(channel, size - Footer.FOOTER_SIZE, Footer.FOOTER_SIZE));
 
         // 3. Validate index offsets from footer
         long dataEndOffset = SSTableHeader.HEADER_SIZE + (long) footer.blockCount() * header.blockSize();
@@ -135,17 +130,11 @@ public final class DefaultTableHandle implements TableHandle {
             if (bloomLength > Integer.MAX_VALUE) {
                 throw new StorageException(ErrorCode.CORRUPTION, "Invalid BloomFilter block length: " + bloomLength);
             }
-            ByteBuffer bloomBuf = ByteBuffer.allocate((int) bloomLength).order(ByteOrder.BIG_ENDIAN);
-            readFully(channel, bloomBuf, dataEndOffset);
-            bloomBuf.flip();
-            bloomFilter = BloomFilter.decode(bloomBuf);
+            bloomFilter = BloomFilter.decode(readBuffer(channel, dataEndOffset, (int) bloomLength));
         }
 
         // 5. Read and decode Sparse Index
-        ByteBuffer indexBuf = ByteBuffer.allocate((int) footer.indexLength()).order(ByteOrder.BIG_ENDIAN);
-        readFully(channel, indexBuf, footer.indexOffset());
-        indexBuf.flip();
-        SparseIndex sparseIndex = SparseIndex.decode(indexBuf);
+        SparseIndex sparseIndex = SparseIndex.decode(readBuffer(channel, footer.indexOffset(), (int) footer.indexLength()));
 
         if (sparseIndex.blocks().size() != footer.blockCount()) {
             throw new StorageException(ErrorCode.CORRUPTION,
@@ -213,6 +202,35 @@ public final class DefaultTableHandle implements TableHandle {
         return bloomFilter.mightContain(key);
     }
 
+    @Override
+    public Optional<ByteKey> firstKey() {
+        List<BlockMeta> blocks = sparseIndex.blocks();
+        return blocks.isEmpty()
+                ? Optional.empty()
+                : Optional.of(ByteKey.copyOf(blocks.getFirst().firstKey()));
+    }
+
+    @Override
+    public Optional<ByteKey> lastKey() {
+        if (cachedLastKey != null) {
+            return Optional.of(cachedLastKey);
+        }
+        List<BlockMeta> blocks = sparseIndex.blocks();
+        if (blocks.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            BlockMeta lastBlock = blocks.getLast();
+            List<InternalRecord> records = DataBlockDecoder.readAndDecode(channel, lastBlock.blockOffset());
+            if (!records.isEmpty()) {
+                cachedLastKey = records.getLast().key();
+                return Optional.of(cachedLastKey);
+            }
+        } catch (Exception ignored) {
+        }
+        return Optional.of(ByteKey.copyOf(blocks.getLast().firstKey()));
+    }
+
     public void pin() {
         refCount.incrementAndGet();
     }
@@ -244,17 +262,13 @@ public final class DefaultTableHandle implements TableHandle {
             return Optional.empty();
         }
 
-        List<BlockMeta> blocks = sparseIndex.blocks();
-        if (blocks.isEmpty()) {
-            return Optional.empty();
-        }
-
         // Check if key is strictly smaller than the first key of the entire SSTable
-        if (key.compareTo(ByteKey.copyOf(blocks.get(0).firstKey())) < 0) {
+        Optional<ByteKey> minKey = firstKey();
+        if (minKey.isEmpty() || key.compareTo(minKey.get()) < 0) {
             return Optional.empty();
         }
 
-        // Binary search to find the block with the largest firstKey <= key
+        List<BlockMeta> blocks = sparseIndex.blocks();
         int candidateIndex = findCandidateBlockIndex(key, blocks);
         if (candidateIndex < 0) {
             return Optional.empty();
@@ -314,6 +328,13 @@ public final class DefaultTableHandle implements TableHandle {
         try {
             channel.close();
         } catch (IOException ignored) {}
+    }
+
+    private static ByteBuffer readBuffer(ChannelIO channel, long offset, int length) throws StorageException {
+        ByteBuffer buf = ByteBuffer.allocate(length).order(ByteOrder.BIG_ENDIAN);
+        readFully(channel, buf, offset);
+        buf.flip();
+        return buf;
     }
 
     private static void readFully(ChannelIO channel, ByteBuffer buffer, long position) throws StorageException {
