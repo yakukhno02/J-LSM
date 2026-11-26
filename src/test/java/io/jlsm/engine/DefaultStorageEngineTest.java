@@ -834,4 +834,28 @@ class DefaultStorageEngineTest {
             assertThat(reopened.get(bytes("gamma"))).isNull();
         }
     }
+    @Test
+    @DisplayName("Online hot backup via db.backup() exports consistent snapshot that can be restored")
+    void testHotBackupViaDatabase(@TempDir Path tempDir) throws Exception {
+        Path dbDir = tempDir.resolve("db");
+        Path backupDir = tempDir.resolve("backup");
+        Path restoreDir = tempDir.resolve("restored");
+
+        try (KVDatabase db = KVDatabase.open(dbDir, DatabaseOptions.defaults())) {
+            db.put(bytes("key1"), bytes("val1"));
+            db.put(bytes("key2"), bytes("val2"));
+            db.backup(backupDir);
+            // Write more to original db - should not affect backup
+            db.put(bytes("key1"), bytes("val1_overwritten"));
+        }
+
+        StorageBackupManager backupManager = new StorageBackupManager();
+        assertThat(backupManager.verifyBackup(backupDir)).isTrue();
+        backupManager.restoreBackup(backupDir, restoreDir);
+
+        try (KVDatabase restoredDb = KVDatabase.open(restoreDir, DatabaseOptions.defaults())) {
+            assertThat(asString(restoredDb.get(bytes("key1")))).isEqualTo("val1");
+            assertThat(asString(restoredDb.get(bytes("key2")))).isEqualTo("val2");
+        }
+    }
 }

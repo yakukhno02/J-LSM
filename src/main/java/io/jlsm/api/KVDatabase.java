@@ -22,6 +22,13 @@ public interface KVDatabase extends AutoCloseable {
 
     void sync() throws StorageException;
 
+    /**
+     * Creates an online hot backup of the database to the specified target directory.
+     */
+    default void backup(Path backupDirectory) throws StorageException {
+        throw new UnsupportedOperationException("Backup not supported");
+    }
+
     default StorageMetrics metrics() throws StorageException {
         return null;
     }

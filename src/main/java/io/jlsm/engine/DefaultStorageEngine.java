@@ -10,6 +10,9 @@ import io.jlsm.api.StorageException;
 import io.jlsm.api.WriteBatch;
 import io.jlsm.api.StorageMetrics;
 import io.jlsm.compaction.Compactor;
+import io.jlsm.compaction.CompactionPlan;
+import io.jlsm.compaction.CompactionPlanner;
+import io.jlsm.compaction.SizeTieredCompactionPlanner;
 import io.jlsm.compaction.DefaultCompactor;
 import io.jlsm.internal.io.ChannelIO;
 import io.jlsm.internal.io.LockHandle;
@@ -69,6 +72,7 @@ public final class DefaultStorageEngine implements KVDatabase {
     private final DiskStorageReader diskStorageReader;
     private final SSTableFlusher sstableFlusher;
     private final Compactor compactor;
+    private final CompactionPlanner compactionPlanner;
 
     private final ReentrantLock stateLock = new ReentrantLock();
     private final Condition capacityAvailable = stateLock.newCondition();
@@ -107,7 +111,7 @@ public final class DefaultStorageEngine implements KVDatabase {
             DatabaseOptions options,
             RecoveryResult recoveryResult
     ) throws StorageException {
-        this(storageIO, directory, options, recoveryResult, new DefaultCompactor(directory, storageIO));
+        this(storageIO, directory, options, recoveryResult, new DefaultCompactor(directory, storageIO), new SizeTieredCompactionPlanner(options.compactionTrigger(), Compactor.DEFAULT_TARGET_FILE_SIZE));
     }
 
     public DefaultStorageEngine(
@@ -117,11 +121,23 @@ public final class DefaultStorageEngine implements KVDatabase {
             RecoveryResult recoveryResult,
             Compactor compactor
     ) throws StorageException {
+        this(storageIO, directory, options, recoveryResult, compactor, new SizeTieredCompactionPlanner(options.compactionTrigger(), Compactor.DEFAULT_TARGET_FILE_SIZE));
+    }
+
+    public DefaultStorageEngine(
+            StorageIO storageIO,
+            Path directory,
+            DatabaseOptions options,
+            RecoveryResult recoveryResult,
+            Compactor compactor,
+            CompactionPlanner compactionPlanner
+    ) throws StorageException {
         this.storageIO = Objects.requireNonNull(storageIO, "storageIO cannot be null");
         this.directory = Objects.requireNonNull(directory, "directory cannot be null");
         this.options = Objects.requireNonNull(options, "options cannot be null");
         Objects.requireNonNull(recoveryResult, "recoveryResult cannot be null");
         this.compactor = Objects.requireNonNull(compactor, "compactor cannot be null");
+        this.compactionPlanner = Objects.requireNonNull(compactionPlanner, "compactionPlanner cannot be null");
 
         this.lockHandle = recoveryResult.lockHandle();
         this.manifestStore = recoveryResult.manifestStore();
@@ -352,6 +368,20 @@ public final class DefaultStorageEngine implements KVDatabase {
         try {
             ensureOpen();
             activeWalWriter.sync();
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    @Override
+    public void backup(Path backupDirectory) throws StorageException {
+        Objects.requireNonNull(backupDirectory, "backupDirectory cannot be null");
+        stateLock.lock();
+        try {
+            ensureOpen();
+            activeWalWriter.sync();
+            StorageBackupManager backupManager = new StorageBackupManager(storageIO);
+            backupManager.createBackup(directory, backupDirectory);
         } finally {
             stateLock.unlock();
         }
@@ -589,8 +619,11 @@ public final class DefaultStorageEngine implements KVDatabase {
         if (!isCompacting.compareAndSet(false, true)) {
             return;
         }
-        List<TableHandle> pinnedInputs;
-        long outputId;
+
+        List<TableHandle> pinnedInputs = new ArrayList<>();
+        boolean retainTombstones;
+        long targetFileSize;
+
         stateLock.lock();
         try {
             int minTables = force ? 1 : options.compactionTrigger();
@@ -598,39 +631,76 @@ public final class DefaultStorageEngine implements KVDatabase {
                 isCompacting.set(false);
                 return;
             }
-            pinnedInputs = pinLiveTables();
-            outputId = nextFileId++;
+
+            Optional<CompactionPlan> planOpt = force
+                    ? compactionPlanner.planFullCompaction(liveTables)
+                    : compactionPlanner.plan(liveTables);
+
+            if (planOpt.isEmpty()) {
+                isCompacting.set(false);
+                return;
+            }
+
+            CompactionPlan plan = planOpt.get();
+            retainTombstones = plan.retainTombstones();
+            targetFileSize = plan.targetFileSizeBytes();
+
+            for (TableHandle handle : plan.selectedTables()) {
+                handle.pin();
+                pinnedInputs.add(handle);
+            }
         } finally {
             stateLock.unlock();
         }
 
-        Optional<TableMeta> compactedMeta;
+        List<TableMeta> compactedMetas;
         try {
-            compactedMeta = compactor.build(outputId, pinnedInputs, false);
+            compactedMetas = compactor.buildSplit(
+                    () -> {
+                        stateLock.lock();
+                        try {
+                            return nextFileId++;
+                        } finally {
+                            stateLock.unlock();
+                        }
+                    },
+                    pinnedInputs,
+                    retainTombstones,
+                    targetFileSize
+            );
         } catch (Exception e) {
             unpinTables(pinnedInputs);
             isCompacting.set(false);
             if (e instanceof StorageException se) {
                 throw se;
             }
-            throw new StorageException(ErrorCode.IO, "Compaction failed during build", e);
+            throw new StorageException(ErrorCode.IO, "Compaction failed during buildSplit", e);
         }
 
-        TableHandle newTableHandle = null;
-        if (compactedMeta.isPresent()) {
-            Path newSstPath = directory.resolve(String.format("%06d.sst", outputId));
-            try {
-                newTableHandle = DefaultTableHandle.open(storageIO, newSstPath, compactedMeta.get());
-            } catch (Exception e) {
-                unpinTables(pinnedInputs);
+        List<TableHandle> newTableHandles = new ArrayList<>();
+        if (!compactedMetas.isEmpty()) {
+            for (TableMeta meta : compactedMetas) {
+                Path newSstPath = directory.resolve(String.format("%06d.sst", meta.tableId()));
                 try {
-                    storageIO.deleteIfExists(newSstPath);
-                } catch (IOException ignored) {}
-                isCompacting.set(false);
-                if (e instanceof StorageException se) {
-                    throw se;
+                    newTableHandles.add(DefaultTableHandle.open(storageIO, newSstPath, meta));
+                } catch (Exception e) {
+                    for (TableHandle opened : newTableHandles) {
+                        try {
+                            opened.close();
+                        } catch (Exception ignored) {}
+                    }
+                    unpinTables(pinnedInputs);
+                    for (TableMeta m : compactedMetas) {
+                        try {
+                            storageIO.deleteIfExists(directory.resolve(String.format("%06d.sst", m.tableId())));
+                        } catch (IOException ignored) {}
+                    }
+                    isCompacting.set(false);
+                    if (e instanceof StorageException se) {
+                        throw se;
+                    }
+                    throw new StorageException(ErrorCode.IO, "Failed to open newly compacted table: " + newSstPath, e);
                 }
-                throw new StorageException(ErrorCode.IO, "Failed to open newly compacted table", e);
             }
         }
 
@@ -642,13 +712,14 @@ public final class DefaultStorageEngine implements KVDatabase {
         stateLock.lock();
         try {
             if (closed) {
-                if (newTableHandle != null) {
+                for (TableHandle opened : newTableHandles) {
                     try {
-                        newTableHandle.close();
+                        opened.close();
                     } catch (Exception ignored) {}
+                }
+                for (TableMeta m : compactedMetas) {
                     try {
-                        Path newSstPath = directory.resolve(String.format("%06d.sst", outputId));
-                        storageIO.deleteIfExists(newSstPath);
+                        storageIO.deleteIfExists(directory.resolve(String.format("%06d.sst", m.tableId())));
                     } catch (IOException ignored) {}
                 }
                 unpinTables(pinnedInputs);
@@ -662,14 +733,12 @@ public final class DefaultStorageEngine implements KVDatabase {
                     updatedTables.add(meta);
                 }
             }
-            compactedMeta.ifPresent(updatedTables::add);
+            updatedTables.addAll(compactedMetas);
 
             commitManifest(currentSnapshot.wals(), updatedTables, "compaction commit");
 
             liveTables.removeIf(t -> compactedTableIds.contains(t.id()));
-            if (newTableHandle != null) {
-                liveTables.add(newTableHandle);
-            }
+            liveTables.addAll(newTableHandles);
             compactionCount.incrementAndGet();
 
             for (TableHandle handle : pinnedInputs) {
