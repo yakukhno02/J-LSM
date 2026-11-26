@@ -34,6 +34,7 @@ public final class DefaultTableHandle implements TableHandle {
     private final long fileSize;
     private final AtomicInteger refCount = new AtomicInteger(1);
     private volatile boolean closed;
+    private volatile ByteKey cachedLastKey;
 
     private DefaultTableHandle(
             ChannelIO channel,
@@ -213,6 +214,35 @@ public final class DefaultTableHandle implements TableHandle {
         return bloomFilter.mightContain(key);
     }
 
+    @Override
+    public Optional<ByteKey> firstKey() {
+        List<BlockMeta> blocks = sparseIndex.blocks();
+        return blocks.isEmpty()
+                ? Optional.empty()
+                : Optional.of(ByteKey.copyOf(blocks.getFirst().firstKey()));
+    }
+
+    @Override
+    public Optional<ByteKey> lastKey() {
+        if (cachedLastKey != null) {
+            return Optional.of(cachedLastKey);
+        }
+        List<BlockMeta> blocks = sparseIndex.blocks();
+        if (blocks.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            BlockMeta lastBlock = blocks.getLast();
+            List<InternalRecord> records = DataBlockDecoder.readAndDecode(channel, lastBlock.blockOffset());
+            if (!records.isEmpty()) {
+                cachedLastKey = records.getLast().key();
+                return Optional.of(cachedLastKey);
+            }
+        } catch (Exception ignored) {
+        }
+        return Optional.of(ByteKey.copyOf(blocks.getLast().firstKey()));
+    }
+
     public void pin() {
         refCount.incrementAndGet();
     }
@@ -244,17 +274,13 @@ public final class DefaultTableHandle implements TableHandle {
             return Optional.empty();
         }
 
-        List<BlockMeta> blocks = sparseIndex.blocks();
-        if (blocks.isEmpty()) {
-            return Optional.empty();
-        }
-
         // Check if key is strictly smaller than the first key of the entire SSTable
-        if (key.compareTo(ByteKey.copyOf(blocks.get(0).firstKey())) < 0) {
+        Optional<ByteKey> minKey = firstKey();
+        if (minKey.isEmpty() || key.compareTo(minKey.get()) < 0) {
             return Optional.empty();
         }
 
-        // Binary search to find the block with the largest firstKey <= key
+        List<BlockMeta> blocks = sparseIndex.blocks();
         int candidateIndex = findCandidateBlockIndex(key, blocks);
         if (candidateIndex < 0) {
             return Optional.empty();
