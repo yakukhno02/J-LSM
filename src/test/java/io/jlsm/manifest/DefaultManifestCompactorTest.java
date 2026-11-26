@@ -70,4 +70,57 @@ class DefaultManifestCompactorTest {
         assertThatThrownBy(() -> compactor.compact(null))
                 .isInstanceOf(NullPointerException.class);
     }
+
+    @Test
+    @DisplayName("Manifest compactor returns actual file size and preserves directory getter")
+    void testCompactorReturnSizeAndDirectory(@TempDir Path tempDir) throws Exception {
+        StorageIO storageIO = new StandardStorageIO();
+        DefaultManifestCompactor compactor = new DefaultManifestCompactor(storageIO, tempDir);
+        assertThat(compactor.directory()).isEqualTo(tempDir);
+
+        Path manifestPath = tempDir.resolve("MANIFEST");
+        ManifestSnapshot snapshot = new ManifestSnapshot(
+                1, 2, 100L,
+                List.of(new WalMeta(1, false)),
+                List.of(new TableMeta(1, 0, 100, 50, 1024))
+        );
+        try (ChannelIO channel = storageIO.createNew(manifestPath);
+             DefaultManifestStore store = DefaultManifestStore.open(channel, manifestPath, ManifestSnapshot.empty())) {
+            store.commit(snapshot);
+        }
+
+        // Create an existing MANIFEST.tmp to ensure deleteIfExists is called
+        Path tmpPath = tempDir.resolve("MANIFEST.tmp");
+        java.nio.file.Files.writeString(tmpPath, "stale temp content");
+
+        long compactedSize = compactor.compact(snapshot);
+        long actualDiskSize = java.nio.file.Files.size(manifestPath);
+        assertThat(compactedSize).isEqualTo(actualDiskSize);
+        assertThat(java.nio.file.Files.exists(tmpPath)).isFalse();
+    }
+
+    @Test
+    @DisplayName("Manifest compactor cleans up temporary file upon store failure")
+    void testFailureCleansUpTempFile(@TempDir Path tempDir) throws Exception {
+        io.jlsm.internal.io.FaultInjectingStorage storage = new io.jlsm.internal.io.FaultInjectingStorage();
+        DefaultManifestCompactor compactor = new DefaultManifestCompactor(storage, tempDir);
+
+        Path manifestPath = tempDir.resolve("MANIFEST");
+        ManifestSnapshot snapshot = new ManifestSnapshot(
+                1, 2, 100L,
+                List.of(new WalMeta(1, false)),
+                List.of(new TableMeta(1, 0, 100, 50, 1024))
+        );
+
+        // Fail atomic move
+        storage.failOnAtomicMove(true);
+
+        assertThatThrownBy(() -> compactor.compact(snapshot))
+                .isInstanceOf(io.jlsm.api.StorageException.class)
+                .hasMessageContaining("Failed to atomically publish compacted MANIFEST");
+
+        // The temporary file should have been cleaned up in the catch block
+        Path tmpPath = tempDir.resolve("MANIFEST.tmp");
+        assertThat(java.nio.file.Files.exists(tmpPath)).isFalse();
+    }
 }
