@@ -223,9 +223,22 @@ public final class JLsmCli {
                 double elapsedUs = (System.nanoTime() - t0) / 1000.0;
                 out.printf(Locale.US, "OK [tombstone written] (%.1f us)%n", elapsedUs);
             }
+            case "delete-range", "del-range" -> {
+                if (tokens.size() < 3) {
+                    out.println("Usage: delete-range <fromKey> <toKey>");
+                    return;
+                }
+                String fromKey = tokens.get(1);
+                String toKey = tokens.get(2);
+                long t0 = System.nanoTime();
+                db.deleteRange(bytes(fromKey), bytes(toKey));
+                double elapsedUs = (System.nanoTime() - t0) / 1000.0;
+                out.printf(Locale.US, "OK [range tombstone [\"%s\", \"%s\") written] (%.1f us)%n",
+                        fromKey, toKey, elapsedUs);
+            }
             case "batch" -> {
                 if (tokens.size() < 2) {
-                    out.println("Usage: batch <put:key=val | del:key> ...");
+                    out.println("Usage: batch <put:key=val | del:key | delrange:from..to> ...");
                     return;
                 }
                 long t0 = System.nanoTime();
@@ -248,8 +261,17 @@ public final class JLsmCli {
                                 return;
                             }
                             batch.delete(bytes(k));
+                        } else if (spec.startsWith("delrange:")) {
+                            int sep = spec.indexOf("..", 9);
+                            if (sep <= 9 || sep + 2 >= spec.length()) {
+                                out.println("Invalid batch range delete specification: " + spec + " (expected delrange:fromKey..toKey)");
+                                return;
+                            }
+                            String fromK = spec.substring(9, sep);
+                            String toK = spec.substring(sep + 2);
+                            batch.deleteRange(bytes(fromK), bytes(toK));
                         } else {
-                            out.println("Unknown batch operation: " + spec + " (use put:key=val or del:key)");
+                            out.println("Unknown batch operation: " + spec + " (use put:key=val, del:key, or delrange:from..to)");
                             return;
                         }
                     }
@@ -405,7 +427,7 @@ public final class JLsmCli {
             Thread.sleep(100L);
             printMetricsDashboard(db.metrics(), out);
 
-            out.println("\n[Step 3] Executing Atomic WriteBatch (0x03) & Consistent Read Snapshot isolation (M8)...");
+            out.println("\n[Step 3] Executing Atomic WriteBatch (0x03), Range Delete (0x04) & Snapshot isolation (M8)...");
             try (WriteBatch batch = WriteBatch.create()) {
                 batch.put(bytes("batch:1"), bytes("atomic-val-1"))
                      .put(bytes("batch:2"), bytes("atomic-val-2"))
@@ -416,10 +438,14 @@ public final class JLsmCli {
             try (Snapshot snap = db.snapshot()) {
                 long snapSeq = snap.sequenceNumber();
                 db.put(bytes("batch:1"), bytes("mutated-after-snapshot"));
+                db.deleteRange(bytes("metric:040"), bytes("metric:046"));
                 String snapVal = new String(snap.get(bytes("batch:1")), StandardCharsets.UTF_8);
                 String liveVal = new String(db.get(bytes("batch:1")), StandardCharsets.UTF_8);
                 out.printf("  Snapshot [seq=%d] get(\"batch:1\") -> \"%s\" (isolated from live update \"%s\")%n",
                         snapSeq, snapVal, liveVal);
+                out.printf("  Executed deleteRange([\"metric:040\", \"metric:046\")): live get(\"metric:042\") -> %s, snapshot get(\"metric:042\") -> \"%s\"%n",
+                        db.get(bytes("metric:042")) == null ? "(nil)" : "present",
+                        new String(snap.get(bytes("metric:042")), StandardCharsets.UTF_8));
             }
 
             out.println("\n[Step 3b] Executing Range Scan [\"metric:001\", \"metric:006\") across MemTable + SSTables...");
@@ -519,7 +545,8 @@ public final class JLsmCli {
         out.println("  put <key> <value>              Insert or update a key-value pair");
         out.println("  get <key>                      Retrieve value by key");
         out.println("  delete <key> (or del <key>)    Mark key as deleted (Tombstone)");
-        out.println("  batch <put:k=v|del:k> ...      Commit an atomic WriteBatch (WAL frame 0x03)");
+        out.println("  delete-range <fromKey> <toKey> Delete key interval [fromKey, toKey) via RangeTombstone (0x04)");
+        out.println("  batch <put:k=v|del:k|delrange:a..b> Commit an atomic WriteBatch (WAL frame 0x03)");
         out.println("  snap [fromKey|*] [toKey|*]     Point-in-time Snapshot range scan");
         out.println("  scan [fromKey|*] [toKey|*]     Range scan [fromKey, toKey) in unsigned byte order");
         out.println("  sync                           Force active WAL fsync to disk");

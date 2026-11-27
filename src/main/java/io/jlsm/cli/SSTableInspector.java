@@ -105,8 +105,15 @@ public final class SSTableInspector {
                 for (int r = 0; r < previewLimit; r++) {
                     InternalRecord rec = records.get(r);
                     String k = formatPreview(rec.key().bytes());
-                    String v = rec.isTombstone() ? "<TOMBSTONE>" : "\"" + formatPreview(rec.value()) + "\"";
-                    out.printf("    [%d] seq=%d | %-6s | key=\"%s\" -> %s%n",
+                    String v;
+                    if (rec instanceof InternalRecord.RangeDelete rd) {
+                        v = "<RANGE_TOMBSTONE [\"" + k + "\", \"" + formatPreview(rd.toKey().bytes()) + "\")>";
+                    } else if (rec.isTombstone()) {
+                        v = "<TOMBSTONE>";
+                    } else {
+                        v = "\"" + formatPreview(rec.value()) + "\"";
+                    }
+                    out.printf("    [%d] seq=%d | %-12s | key=\"%s\" -> %s%n",
                             r, rec.sequence(), rec.kind(), k, v);
                 }
                 if (records.size() > previewLimit) {
