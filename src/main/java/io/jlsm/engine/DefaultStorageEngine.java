@@ -103,7 +103,11 @@ public final class DefaultStorageEngine implements KVDatabase {
     private final List<TableHandle> liveTables;
     private boolean closed;
 
-    private record ObsoleteTable(long tableId, Path path, TableHandle handle) {}
+    private record ObsoleteTable(long tableId, Path path, TableHandle handle) {
+        boolean isClosed() {
+            return handle.isClosed();
+        }
+    }
 
     public DefaultStorageEngine(
             StorageIO storageIO,
@@ -187,6 +191,38 @@ public final class DefaultStorageEngine implements KVDatabase {
     @Override
     public void delete(byte[] key) throws StorageException {
         applyMutation(key, null, RecordKind.DELETE);
+    }
+
+    @Override
+    public void deleteRange(byte[] fromKey, byte[] toKey) throws StorageException {
+        if (fromKey == null || toKey == null) {
+            throw new IllegalArgumentException("fromKey and toKey cannot be null");
+        }
+        if (fromKey.length == 0 || toKey.length == 0) {
+            throw new IllegalArgumentException("fromKey and toKey cannot be empty");
+        }
+        ByteKey bFrom = ByteKey.copyOf(fromKey);
+        ByteKey bTo = ByteKey.copyOf(toKey);
+        if (bFrom.compareTo(bTo) >= 0) {
+            throw new IllegalArgumentException("fromKey must be strictly smaller than toKey: ["
+                    + bFrom + ", " + bTo + ")");
+        }
+
+        deletesCount.incrementAndGet();
+        memoryBudgetManager.checkBackpressure();
+
+        stateLock.lock();
+        try {
+            ensureOpen();
+            checkAndRotateMemTable();
+            long seq = ++highSequence;
+            activeWalWriter.append(seq, RecordKind.RANGE_DELETE, fromKey, toKey);
+            InternalRecord record = new InternalRecord.RangeDelete(bFrom, bTo, seq);
+            long delta = activeMemTable.insert(bFrom, record);
+            memoryBudgetManager.update(delta);
+        } finally {
+            stateLock.unlock();
+        }
     }
 
     private void applyMutation(byte[] key, byte[] value, RecordKind kind) throws StorageException {
@@ -284,16 +320,19 @@ public final class DefaultStorageEngine implements KVDatabase {
                 BatchOperation op = ops.get(i);
                 long seq = startSeq + i;
                 ByteKey byteKey = ByteKey.copyOf(op.rawKey());
-                InternalRecord record = op.kind() == RecordKind.PUT
-                        ? new InternalRecord.Put(byteKey, op.rawValue(), seq)
-                        : new InternalRecord.Delete(byteKey, seq);
-                long delta = activeMemTable.insert(byteKey, record);
-                memoryBudgetManager.update(delta);
+                InternalRecord record;
                 if (op.kind() == RecordKind.PUT) {
+                    record = new InternalRecord.Put(byteKey, op.rawValue(), seq);
                     putsCount.incrementAndGet();
+                } else if (op.kind() == RecordKind.RANGE_DELETE) {
+                    record = new InternalRecord.RangeDelete(byteKey, ByteKey.copyOf(op.rawValue()), seq);
+                    deletesCount.incrementAndGet();
                 } else {
+                    record = new InternalRecord.Delete(byteKey, seq);
                     deletesCount.incrementAndGet();
                 }
+                long delta = activeMemTable.insert(byteKey, record);
+                memoryBudgetManager.update(delta);
             }
         } finally {
             stateLock.unlock();
@@ -817,7 +856,7 @@ public final class DefaultStorageEngine implements KVDatabase {
 
     private void cleanObsoleteTables() {
         obsoleteTables.removeIf(obs -> {
-            boolean canDelete = obs.handle().isClosed();
+            boolean canDelete = obs.isClosed();
             if (canDelete) {
                 try {
                     storageIO.deleteIfExists(obs.path());
