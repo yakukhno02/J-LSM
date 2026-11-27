@@ -3,5 +3,6 @@ package io.jlsm.internal.model;
 public enum RecordKind {
     PUT,
     DELETE,
-    BATCH
+    BATCH,
+    RANGE_DELETE
 }

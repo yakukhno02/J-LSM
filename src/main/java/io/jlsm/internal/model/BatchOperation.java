@@ -24,6 +24,12 @@ public record BatchOperation(RecordKind kind, byte[] key, byte[] value) {
                 throw new IllegalArgumentException("value must be null or empty for DELETE operation");
             }
             value = null;
+        } else if (kind == RecordKind.RANGE_DELETE) {
+            Objects.requireNonNull(value, "value (toKey) cannot be null for RANGE_DELETE operation");
+            if (Arrays.compare(key, value) >= 0) {
+                throw new IllegalArgumentException("fromKey must be strictly smaller than toKey for RANGE_DELETE: ["
+                        + Arrays.toString(key) + ", " + Arrays.toString(value) + ")");
+            }
         } else {
             throw new IllegalArgumentException("Unsupported batch operation kind: " + kind);
         }
@@ -38,6 +44,12 @@ public record BatchOperation(RecordKind kind, byte[] key, byte[] value) {
     public static BatchOperation delete(byte[] key) {
         Objects.requireNonNull(key, "key cannot be null");
         return new BatchOperation(RecordKind.DELETE, key.clone(), null);
+    }
+
+    public static BatchOperation deleteRange(byte[] fromKey, byte[] toKey) {
+        Objects.requireNonNull(fromKey, "fromKey cannot be null");
+        Objects.requireNonNull(toKey, "toKey cannot be null");
+        return new BatchOperation(RecordKind.RANGE_DELETE, fromKey.clone(), toKey.clone());
     }
 
     public long byteSize() {
