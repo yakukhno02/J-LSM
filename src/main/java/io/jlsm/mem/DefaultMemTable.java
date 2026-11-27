@@ -5,6 +5,7 @@ import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordCursor;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -16,12 +17,13 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Concurrent, sorted in-memory representation of entries backed by a {@link ConcurrentSkipListMap}.
  * Keys are ordered lexicographically by their unsigned byte values via {@link ByteKey#compareTo(ByteKey)}.
- * Maintains historical versions for point-in-time snapshot reads.
+ * Maintains historical versions for point-in-time snapshot reads and range tombstones.
  */
 public final class DefaultMemTable implements MemTable {
 
@@ -30,12 +32,14 @@ public final class DefaultMemTable implements MemTable {
 
     private final ConcurrentSkipListMap<ByteKey, InternalRecord> map;
     private final ConcurrentSkipListMap<InternalKey, InternalRecord> historyMap;
+    private final List<InternalRecord.RangeDelete> rangeTombstones;
     private final AtomicLong byteSize;
     private final Set<Long> attachedWalIds;
 
     public DefaultMemTable() {
         this.map = new ConcurrentSkipListMap<>();
         this.historyMap = new ConcurrentSkipListMap<>();
+        this.rangeTombstones = new CopyOnWriteArrayList<>();
         this.byteSize = new AtomicLong(0L);
         this.attachedWalIds = ConcurrentHashMap.newKeySet();
     }
@@ -44,6 +48,13 @@ public final class DefaultMemTable implements MemTable {
     public long insert(ByteKey key, InternalRecord record) {
         Objects.requireNonNull(key, "key cannot be null");
         Objects.requireNonNull(record, "record cannot be null");
+
+        if (record instanceof InternalRecord.RangeDelete rd) {
+            rangeTombstones.add(rd);
+            long deltaBytes = calculateRecordBytes(key, record);
+            byteSize.addAndGet(deltaBytes);
+            return deltaBytes;
+        }
 
         long recordBytes = calculateRecordBytes(key, record);
         InternalRecord oldRecord = map.put(key, record);
@@ -62,23 +73,47 @@ public final class DefaultMemTable implements MemTable {
 
     @Override
     public Optional<InternalRecord> get(ByteKey key) {
-        Objects.requireNonNull(key, "key cannot be null");
-        return Optional.ofNullable(map.get(key));
+        return get(key, Long.MAX_VALUE);
     }
 
     @Override
     public Optional<InternalRecord> get(ByteKey key, long maxSequence) {
         Objects.requireNonNull(key, "key cannot be null");
-        InternalRecord latest = map.get(key);
-        if (latest != null && latest.sequence() <= maxSequence) {
-            return Optional.of(latest);
+
+        // 1. Find highest sequence matching range tombstone
+        InternalRecord.RangeDelete matchingRangeDelete = null;
+        for (InternalRecord.RangeDelete rd : rangeTombstones) {
+            if (rd.sequence() <= maxSequence && rd.fromKey().compareTo(key) <= 0 && key.compareTo(rd.toKey()) < 0) {
+                if (matchingRangeDelete == null || rd.sequence() > matchingRangeDelete.sequence()) {
+                    matchingRangeDelete = rd;
+                }
+            }
         }
 
-        // Latest record is newer than maxSequence or absent; search history
-        Map.Entry<InternalKey, InternalRecord> entry =
-                historyMap.ceilingEntry(new InternalKey(key, maxSequence));
-        if (entry != null && entry.getKey().key().equals(key)) {
-            return Optional.of(entry.getValue());
+        // 2. Find point record at or before maxSequence
+        InternalRecord pointRecord = null;
+        InternalRecord latest = map.get(key);
+        if (latest != null && latest.sequence() <= maxSequence) {
+            pointRecord = latest;
+        } else if (!historyMap.isEmpty()) {
+            Map.Entry<InternalKey, InternalRecord> entry =
+                    historyMap.ceilingEntry(new InternalKey(key, maxSequence));
+            if (entry != null && entry.getKey().key().equals(key)) {
+                pointRecord = entry.getValue();
+            }
+        }
+
+        // 3. Resolve conflict
+        if (pointRecord != null && matchingRangeDelete != null) {
+            if (matchingRangeDelete.sequence() > pointRecord.sequence()) {
+                return Optional.of(new InternalRecord.Delete(key, matchingRangeDelete.sequence()));
+            } else {
+                return Optional.of(pointRecord);
+            }
+        } else if (pointRecord != null) {
+            return Optional.of(pointRecord);
+        } else if (matchingRangeDelete != null) {
+            return Optional.of(new InternalRecord.Delete(key, matchingRangeDelete.sequence()));
         }
 
         return Optional.empty();
@@ -96,11 +131,6 @@ public final class DefaultMemTable implements MemTable {
         }
 
         ConcurrentNavigableMap<ByteKey, InternalRecord> keyView = rangeView(map, fromKey, toKey);
-
-        if (maxSequence == Long.MAX_VALUE && historyMap.isEmpty()) {
-            return new MemTableRecordCursor(new ArrayList<>(keyView.values()).iterator());
-        }
-
         NavigableSet<ByteKey> allKeys = new TreeSet<>(keyView.keySet());
 
         if (!historyMap.isEmpty()) {
@@ -116,7 +146,30 @@ public final class DefaultMemTable implements MemTable {
             get(k, maxSequence).ifPresent(result::add);
         }
 
+        for (InternalRecord.RangeDelete rd : rangeTombstones) {
+            if (rd.sequence() <= maxSequence) {
+                if (fromKey != null && rd.toKey().compareTo(fromKey) <= 0) {
+                    continue;
+                }
+                if (toKey != null && rd.fromKey().compareTo(toKey) >= 0) {
+                    continue;
+                }
+                result.add(rd);
+            }
+        }
+
+        result.sort((r1, r2) -> {
+            int cmp = r1.key().compareTo(r2.key());
+            if (cmp != 0) return cmp;
+            return Long.compare(r2.sequence(), r1.sequence());
+        });
+
         return new MemTableRecordCursor(result.iterator());
+    }
+
+    @Override
+    public List<InternalRecord.RangeDelete> rangeTombstones() {
+        return Collections.unmodifiableList(rangeTombstones);
     }
 
     @Override
@@ -126,13 +179,14 @@ public final class DefaultMemTable implements MemTable {
 
     @Override
     public boolean isEmpty() {
-        return map.isEmpty();
+        return map.isEmpty() && rangeTombstones.isEmpty();
     }
 
     @Override
     public void clear() {
         map.clear();
         historyMap.clear();
+        rangeTombstones.clear();
         byteSize.set(0L);
         attachedWalIds.clear();
     }

@@ -12,6 +12,11 @@ public interface KVDatabase extends AutoCloseable {
     void delete(byte[] key) throws StorageException;
 
     /**
+     * Deletes all keys in the half-open range {@code [fromKey, toKey)}.
+     */
+    void deleteRange(byte[] fromKey, byte[] toKey) throws StorageException;
+
+    /**
      * Atomically applies all operations in the given batch.
      */
     void write(WriteBatch batch) throws StorageException;

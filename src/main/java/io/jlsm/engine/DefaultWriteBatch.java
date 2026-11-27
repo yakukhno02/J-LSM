@@ -38,6 +38,17 @@ public final class DefaultWriteBatch implements WriteBatch {
     }
 
     @Override
+    public WriteBatch deleteRange(byte[] fromKey, byte[] toKey) {
+        ensureOpen();
+        Objects.requireNonNull(fromKey, "fromKey cannot be null");
+        Objects.requireNonNull(toKey, "toKey cannot be null");
+        BatchOperation op = BatchOperation.deleteRange(fromKey, toKey);
+        operations.add(op);
+        totalBytes += op.byteSize();
+        return this;
+    }
+
+    @Override
     public int operationCount() {
         ensureOpen();
         return operations.size();

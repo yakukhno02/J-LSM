@@ -4,6 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class InternalRecordTest {
 
@@ -60,7 +61,7 @@ class InternalRecordTest {
     @DisplayName("Sealed hierarchy: Put rejects null value, accepts empty byte array")
     void testPutRecordValidation() {
         ByteKey key = ByteKey.copyOf(new byte[]{1});
-        org.assertj.core.api.Assertions.assertThatThrownBy(() -> new InternalRecord.Put(key, null, 1L))
+        assertThatThrownBy(() -> new InternalRecord.Put(key, null, 1L))
                 .isInstanceOf(NullPointerException.class);
 
         InternalRecord.Put emptyValPut = new InternalRecord.Put(key, new byte[0], 2L);
@@ -70,22 +71,52 @@ class InternalRecordTest {
     }
 
     @Test
+    @DisplayName("RangeDelete validation and behaviour")
+    void testRangeDelete() {
+        ByteKey k1 = ByteKey.copyOf(new byte[]{1});
+        ByteKey k2 = ByteKey.copyOf(new byte[]{5});
+
+        InternalRecord.RangeDelete rd = InternalRecord.rangeDelete(k1, k2, 10L);
+        assertThat(rd.isTombstone()).isTrue();
+        assertThat(rd.kind()).isEqualTo(RecordKind.RANGE_DELETE);
+        assertThat(rd.key()).isEqualTo(k1);
+        assertThat(rd.fromKey()).isEqualTo(k1);
+        assertThat(rd.toKey()).isEqualTo(k2);
+        assertThat(rd.covers(ByteKey.copyOf(new byte[]{3}), 5L)).isTrue();
+        assertThat(rd.covers(ByteKey.copyOf(new byte[]{3}), 15L)).isFalse();
+        assertThat(rd.covers(ByteKey.copyOf(new byte[]{5}), 5L)).isFalse();
+
+        assertThatThrownBy(() -> InternalRecord.rangeDelete(k2, k1, 10L))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     @DisplayName("Sealed hierarchy: Pattern matching exhaustive switch")
     void testSealedPatternMatching() {
         ByteKey key = ByteKey.copyOf(new byte[]{1});
+        ByteKey key2 = ByteKey.copyOf(new byte[]{2});
         InternalRecord put = new InternalRecord.Put(key, new byte[]{42}, 10L);
         InternalRecord del = new InternalRecord.Delete(key, 20L);
+        InternalRecord rangeDel = new InternalRecord.RangeDelete(key, key2, 30L);
 
         String putDesc = switch (put) {
             case InternalRecord.Put p -> "PUT:" + p.value()[0];
             case InternalRecord.Delete d -> "DEL";
+            case InternalRecord.RangeDelete rd -> "RANGE_DEL";
         };
         String delDesc = switch (del) {
             case InternalRecord.Put p -> "PUT:" + p.value()[0];
             case InternalRecord.Delete d -> "DEL";
+            case InternalRecord.RangeDelete rd -> "RANGE_DEL";
+        };
+        String rangeDelDesc = switch (rangeDel) {
+            case InternalRecord.Put p -> "PUT:" + p.value()[0];
+            case InternalRecord.Delete d -> "DEL";
+            case InternalRecord.RangeDelete rd -> "RANGE_DEL";
         };
 
         assertThat(putDesc).isEqualTo("PUT:42");
         assertThat(delDesc).isEqualTo("DEL");
+        assertThat(rangeDelDesc).isEqualTo("RANGE_DEL");
     }
 }

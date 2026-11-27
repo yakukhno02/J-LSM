@@ -29,6 +29,7 @@ public final class DataBlockEncoder {
 
     public static final byte FLAG_PUT = 0x00;
     public static final byte FLAG_DELETE = 0x01;
+    public static final byte FLAG_RANGE_DELETE = 0x02;
 
     private final byte[] buffer = new byte[BLOCK_SIZE];
     private final ByteBuffer byteBuffer;
@@ -71,7 +72,7 @@ public final class DataBlockEncoder {
         Objects.requireNonNull(key, "key cannot be null");
 
         int keyLen = key.length;
-        int valLen = (kind == RecordKind.PUT && value != null) ? value.length : 0;
+        int valLen = resolveValueLength(kind, value);
 
         if ((long) keyLen + valLen > MAX_KEY_VALUE_TOTAL_BYTES) {
             throw new IllegalArgumentException("Combined key and value length (" + (keyLen + valLen)
@@ -90,15 +91,27 @@ public final class DataBlockEncoder {
         byteBuffer.putLong(sequence);
         byteBuffer.putInt(keyLen);
         byteBuffer.putInt(valLen);
-        byteBuffer.put(kind == RecordKind.PUT ? FLAG_PUT : FLAG_DELETE);
+        byteBuffer.put(toBlockFlag(kind));
         byteBuffer.put(key);
 
-        if (kind == RecordKind.PUT && valLen > 0) {
+        if (valLen > 0) {
             byteBuffer.put(value);
         }
 
         usedBytes = byteBuffer.position();
         recordCount++;
+    }
+
+    private static int resolveValueLength(RecordKind kind, byte[] value) {
+        return (kind == RecordKind.PUT || kind == RecordKind.RANGE_DELETE) && value != null ? value.length : 0;
+    }
+
+    private static byte toBlockFlag(RecordKind kind) {
+        return switch (kind) {
+            case DELETE -> FLAG_DELETE;
+            case RANGE_DELETE -> FLAG_RANGE_DELETE;
+            default -> FLAG_PUT;
+        };
     }
 
     /**

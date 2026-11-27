@@ -3,8 +3,10 @@ package io.jlsm.sst;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
+import io.jlsm.internal.model.RangeTombstone;
 import io.jlsm.internal.model.RecordCursor;
 
+import java.util.List;
 import java.util.Optional;
 
 public interface TableHandle extends AutoCloseable {
@@ -31,6 +33,10 @@ public interface TableHandle extends AutoCloseable {
 
     default Optional<ByteKey> lastKey() {
         return Optional.empty();
+    }
+
+    default List<RangeTombstone> rangeTombstones() {
+        return List.of();
     }
 
     @Override

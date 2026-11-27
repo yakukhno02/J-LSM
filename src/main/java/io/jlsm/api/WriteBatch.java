@@ -10,6 +10,8 @@ public interface WriteBatch extends AutoCloseable {
 
     WriteBatch delete(byte[] key);
 
+    WriteBatch deleteRange(byte[] fromKey, byte[] toKey);
+
     int operationCount();
 
     long byteSize();

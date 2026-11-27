@@ -7,7 +7,6 @@ import org.junit.jupiter.api.Test;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.zip.CRC32;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -142,6 +141,7 @@ class DataBlockEncoderTest {
 
     @Test
     @DisplayName("FinishedBlock validates arguments, defensive copies, equals, and hashCode")
+    @SuppressWarnings("all")
     void testFinishedBlockEqualsHashCodeAndValidation() {
         DataBlockEncoder encoder = new DataBlockEncoder();
         encoder.append(1L, RecordKind.PUT, "k1".getBytes(StandardCharsets.UTF_8), "v1".getBytes(StandardCharsets.UTF_8));
@@ -156,8 +156,8 @@ class DataBlockEncoderTest {
         assertThat(b1).isEqualTo(b1);
         assertThat(b1).isEqualTo(b2);
         assertThat(b1.hashCode()).isEqualTo(b2.hashCode());
-        assertThat(b1).isNotEqualTo(null);
-        assertThat(b1).isNotEqualTo("not-a-block");
+        assertThat(b1.equals(null)).isFalse();
+        assertThat(b1.equals("not-a-block")).isFalse();
         assertThat(b1).isNotEqualTo(bDiffCount);
         assertThat(b1).isNotEqualTo(bDiffKey);
         assertThat(b1).isNotEqualTo(bDiffBytes);
@@ -171,5 +171,16 @@ class DataBlockEncoderTest {
         assertThat(encoder.canFit(5000, 0)).isFalse();
         assertThat(encoder.canFit(-1, 0)).isFalse();
         assertThat(encoder.canFit(0, -1)).isFalse();
+    }
+
+    @Test
+    @DisplayName("DataBlockEncoder encodes RANGE_DELETE record with FLAG_RANGE_DELETE")
+    void testEncodeRangeDelete() {
+        DataBlockEncoder encoder = new DataBlockEncoder();
+        encoder.append(10L, RecordKind.RANGE_DELETE, "from".getBytes(StandardCharsets.UTF_8), "toKey".getBytes(StandardCharsets.UTF_8));
+        FinishedBlock finished = encoder.finishBlock();
+        byte[] block = finished.blockBytes();
+        ByteBuffer bb = ByteBuffer.wrap(block).order(ByteOrder.BIG_ENDIAN);
+        assertThat(bb.get(24)).isEqualTo(DataBlockEncoder.FLAG_RANGE_DELETE);
     }
 }

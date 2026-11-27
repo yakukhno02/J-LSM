@@ -57,7 +57,10 @@
 
 - **Кеш блоків:** Кешування сторінок SSTable у пам'яті залишається поза скоупом, оскільки системний Page Cache ОС ефективно забезпечує дискове кешування без накладних витрат у Heap.
 
-- **Складні транзакції:** Розподілені або багатокрокові ізольовані транзакції (з рівнями ізоляції Serializable/Snapshot Isolation) залишаються поза скоупом. Проте в межах Scope Extension додається **Atomic Write Batch** — атомарне пакетне застосування групи операцій `put` та `delete` за принципом all-or-nothing (Dev 1).
+- **Складні транзакції:** Розподілені або багатокрокові ізольовані транзакції (з рівнями ізоляції Serializable) залишаються поза скоупом. Проте в межах Scope Extensions додаються:
+  1. **Atomic Write Batch** — атомарне пакетне застосування групи операцій `put`, `delete` та `deleteRange` за принципом all-or-nothing (Dev 1).
+  2. **Consistent Read Snapshots** — консистентні знімки для point-in-time читання з MVCC ізоляцією (Dev 1).
+  3. **Range Deletes (Range Tombstones)** — високоефективне видалення діапазонів ключів `[fromKey, toKey)` через інтервальні томбстоуни без поточкового перебору (Cross-cutting / Dev 1 & Dev 2).
 
 - **Фільтри Блума та багаторівневий Compaction:** Початково оптимізації читання та складні стратегії злиття були поза скоупом. У межах Scope Extension для Dev 2 додаються:
   1. **Bloom Filters per SSTable** (бітові фільтри для відсікання зайвих дискових звернень).
@@ -182,7 +185,15 @@ public interface DiskStorageReader {
 
 3.  Фізичне видалення даних з диска не відбувається миттєво; Tombstone маскує старіші версії даних до моменту виконання Compaction.
 
-#### 5.4.4 Точкове читання (get(key))
+#### 5.4.4 Видалення діапазонів (deleteRange(fromKey, toKey) — Scope Extension)
+
+Операція видаляє всі ключі в напіввідкритому інтервалі `[fromKey, toKey)` без необхідності попереднього пошуку або ітерації по окремих ключах:
+1. **Запис у WAL:** У журнал записується бінарний кадр типу `0x04` (RANGE_DELETE) із власним CRC32, де серіалізуються `[FromKeyLen (4B)][ToKeyLen (4B)][FromKey][ToKey]`.
+2. **Збереження в MemTable:** У внутрішній інтервальний індекс додається незмінний об'єкт `RangeTombstone(fromKey, toKey, sequence)`.
+3. **Затінення при читанні (Shadowing):** При виклику `get(key)` та `scan(from, to)` система перевіряє, чи не перекривається ключ активним діапазонним томбстоуном з більшим або рівним `sequence`. Якщо так — ключ вважається видаленим.
+4. **Скидання на диск та злиття:** Діапазонні томбстоуни кодуються в блоках даних SSTable з прапорцем `FLAG_RANGE_DELETE = 0x02`. Під час Compaction `DefaultMergedIterator` динамічно реєструє зустрічні `RangeTombstone` і затінює старіші точкові записи та томбстоуни.
+
+#### 5.4.5 Точкове читання (get(key))
 
 Пошук виконується за принципом ранньої зупинки (Short-Circuit) у хронологічному порядку від найновіших даних до найстаріших:
 
@@ -233,8 +244,9 @@ public interface DiskStorageReader {
 
 *Типи записів:* 
 - `0x01` — звичайне додавання/оновлення (PUT)
-- `0x02` — позначка про видалення (DELETE)
+- `0x02` — позначка про точкове видалення (DELETE)
 - `0x03` — атомарний пакетний запис (BATCH — Scope Extension Dev 1). Кадр батчу містить: `CRC32 (4B) | StartSeq (8B) | Type=0x03 (1B) | OpCount (4B) | PayloadLen (4B) | Payload [OpType (1B) | KeyLen (4B) | ValLen (4B) | Key | Val] * OpCount`.
+- `0x04` — видалення діапазону (RANGE_DELETE — Scope Extension). Кадр містить: `CRC32 (4B) | Seq (8B) | Type=0x04 (1B) | FromKeyLen (4B) | ToKeyLen (4B) | FromKey | ToKey`.
 
 #### Формат файлу таблиці сортованих рядків (SSTable)
 
@@ -242,7 +254,7 @@ public interface DiskStorageReader {
 
 | Секція | Опис структури та вміст |
 | --- | --- |
-| Data Blocks (Блоки даних) | Послідовні блоки розміром ≤ 4 КБ кожен (Data Block 0, Data Block 1, ...). Кожен блок містить:<br>• Кількість записів (4 байти)<br>• Записи: KeyLen (4B) \| ValLen (4B) \| Flags (1B) \| Key \| Value |
+| Data Blocks (Блоки даних) | Послідовні блоки розміром ≤ 4 КБ кожен (Data Block 0, Data Block 1, ...). Кожен блок містить:<br>• Кількість записів (4 байти)<br>• Записи: Seq (8B) \| KeyLen (4B) \| ValLen (4B) \| Flags (1B) \| Key \| Value.<br>Прапорці (Flags): `0x00` (PUT), `0x01` (DELETE), `0x02` (RANGE_DELETE — Key містить fromKey, Value містить toKey). |
 | Bloom Filter Block | Блок фільтра Блума (Scope Extension Dev 2): бітовий масив ($m/n \approx 10$, $k=7$) між блоками даних та індексом |
 | Sparse Index Block (Рідкісний індекс) | Блок індексу для швидкого пошуку блоків даних:<br>• Кількість записів індексу (4 байти)<br>• Записи: Offset (8B) \| BlockSize (4B) \| FirstKeyLen (4B) \| FirstKeyBytes |
 | Footer (Підніжжя) | Фіксована кінцева секція (40 байтів):<br>• Index Offset (8B) \| Index Length (8B) \| Total Records (8B) \| Block Count (4B) \| Format Version (4B) \| Magic Number 0x4A4C534D (4B) \| Footer CRC32 (4B) |
@@ -385,7 +397,7 @@ public interface DiskStorageReader {
 | M5 | Реалізація послідовного читання діапазонів даних (scan). |
 | M6 | Перевірка стійкості коду мутаційними тестами, усунення багів проміжного аудиту (1–7) та закриття прогалин життєвого циклу WAL. |
 | M7 | Інтерактивна демонстраційна утиліта JLsmCli: REPL, покроковий сценарій захисту, інспектор файлів та бенчмарк. |
-| M8 | **Scope Extension (Фінальний добір LOC):**<br>• Розробник 1: `Atomic Write Batches` (інтерфейс, кадр WAL 0x03, All-or-Nothing recovery, тест R-03) та `Consistent Read Snapshots` (інтерфейс `Snapshot`, версіонування `DefaultMemTable`, ref-count pinning, тест P-08).<br>• Розробник 2: `Bloom Filters per SSTable` (бітові фільтри, хешування, інтеграція в точковий пошук, тест P-07). |
+| M8 | **Scope Extension (Фінальний добір LOC):**<br>• Розробник 1: `Atomic Write Batches` (інтерфейс, кадр WAL 0x03, All-or-Nothing recovery, тест R-03) та `Consistent Read Snapshots` (інтерфейс `Snapshot`, версіонування `DefaultMemTable`, ref-count pinning, тест P-08).<br>• Розробник 2: `Bloom Filters per SSTable` (бітові фільтри, хешування, інтеграція в точковий пошук, тест P-07) та `SSTable Splitting / Leveled Compaction Planner`.<br>• Спільно: `Range Deletes / Range Tombstones` (інтерфейс `deleteRange`, бінарний кадр WAL 0x04, прапорець SSTable 0x02, інтервальне затінення в `DefaultMergedIterator` та `DefaultDiskStorageReader`, наскрізний набір тестів `RangeDeleteTest`). |
 | M9 | Фінальний аудит коду (≥ 3 000 core LOC на інженера), повний прогін PIT (≥ 80%) та фінальний захист проєкту. |
 
 

@@ -7,9 +7,12 @@ import io.jlsm.internal.io.StorageIO;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordCursor;
+import io.jlsm.internal.model.RangeTombstone;
 import io.jlsm.manifest.TableMeta;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Path;
@@ -35,6 +38,7 @@ public final class DefaultTableHandle implements TableHandle {
     private final AtomicInteger refCount = new AtomicInteger(1);
     private volatile boolean closed;
     private volatile ByteKey cachedLastKey;
+    private volatile List<RangeTombstone> cachedRangeTombstones;
 
     private DefaultTableHandle(
             ChannelIO channel,
@@ -248,6 +252,32 @@ public final class DefaultTableHandle implements TableHandle {
 
     public boolean isClosed() {
         return closed || refCount.get() <= 0;
+    }
+
+    @Override
+    public List<RangeTombstone> rangeTombstones() {
+        if (cachedRangeTombstones != null) {
+            return cachedRangeTombstones;
+        }
+        synchronized (this) {
+            if (cachedRangeTombstones != null) {
+                return cachedRangeTombstones;
+            }
+            List<RangeTombstone> list = new ArrayList<>();
+            try {
+                for (BlockMeta block : sparseIndex.blocks()) {
+                    List<InternalRecord> records = DataBlockDecoder.readAndDecode(channel, block.blockOffset());
+                    for (InternalRecord r : records) {
+                        if (r instanceof InternalRecord.RangeDelete rd) {
+                            list.add(rd.toRangeTombstone());
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            cachedRangeTombstones = Collections.unmodifiableList(list);
+            return cachedRangeTombstones;
+        }
     }
 
     /**

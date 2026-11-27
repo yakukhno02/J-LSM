@@ -447,4 +447,17 @@ class DefaultWalWriterTest {
         long nextOff = writer.append(2L, RecordKind.PUT, bytes("keyOk"), bytes("valOk"));
         assertThat(nextOff).isEqualTo(validOffsetBefore);
     }
+    @Test
+    @DisplayName("appendRangeDelete writes valid frame with TYPE_RANGE_DELETE")
+    void testAppendRangeDelete() throws Exception {
+        InMemoryChannelIO channel = new InMemoryChannelIO();
+        DefaultWalWriter writer = DefaultWalWriter.create(channel, 1L, DurabilityMode.BUFFERED);
+
+        long offset = writer.appendRangeDelete(42L, bytes("startKey"), bytes("endKey"));
+        assertThat(offset).isEqualTo(32L);
+        assertThat(writer.writeOffset()).isGreaterThan(32L);
+
+        byte typeByte = channel.storage[32 + 4 + 8];
+        assertThat(typeByte).isEqualTo(DefaultWalWriter.TYPE_RANGE_DELETE);
+    }
 }

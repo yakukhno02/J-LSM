@@ -33,7 +33,7 @@ class DataBlockDecoderTest {
 
         assertThat(records).hasSize(3);
 
-        InternalRecord r0 = records.get(0);
+        InternalRecord r0 = records.getFirst();
         assertThat(r0.key()).isEqualTo(ByteKey.copyOf("alpha".getBytes(StandardCharsets.UTF_8)));
         assertThat(r0.value()).isEqualTo("val-alpha".getBytes(StandardCharsets.UTF_8));
         assertThat(r0.kind()).isEqualTo(RecordKind.PUT);
@@ -67,7 +67,7 @@ class DataBlockDecoderTest {
 
         assertThat(records).hasSize(2);
 
-        InternalRecord r1 = records.get(0);
+        InternalRecord r1 = records.getFirst();
         assertThat(r1.sequence()).isEqualTo(1L);
         assertThat(r1.key()).isEqualTo(ByteKey.copyOf("key1".getBytes(StandardCharsets.UTF_8)));
         assertThat(r1.value()).isEqualTo("value1".getBytes(StandardCharsets.UTF_8));
@@ -169,5 +169,20 @@ class DataBlockDecoderTest {
                     assertThat(e.code()).isEqualTo(ErrorCode.CORRUPTION);
                     assertThat(e.getMessage()).contains("Insufficient bytes");
                 });
+    }
+    @Test
+    @DisplayName("DataBlockDecoder successfully decodes RANGE_DELETE records")
+    void testDecodeRangeDelete() throws Exception {
+        DataBlockEncoder encoder = new DataBlockEncoder();
+        encoder.append(50L, RecordKind.RANGE_DELETE, "alpha".getBytes(StandardCharsets.UTF_8), "omega".getBytes(StandardCharsets.UTF_8));
+        byte[] block = encoder.finishBlock().blockBytes();
+
+        List<InternalRecord> records = DataBlockDecoder.decode(block);
+        assertThat(records).hasSize(1);
+        assertThat(records.getFirst()).isInstanceOf(InternalRecord.RangeDelete.class);
+        InternalRecord.RangeDelete rd = (InternalRecord.RangeDelete) records.getFirst();
+        assertThat(rd.sequence()).isEqualTo(50L);
+        assertThat(rd.fromKey()).isEqualTo(ByteKey.copyOf("alpha".getBytes(StandardCharsets.UTF_8)));
+        assertThat(rd.toKey()).isEqualTo(ByteKey.copyOf("omega".getBytes(StandardCharsets.UTF_8)));
     }
 }

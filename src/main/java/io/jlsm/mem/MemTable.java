@@ -3,6 +3,7 @@ package io.jlsm.mem;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
 import io.jlsm.internal.model.RecordCursor;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
@@ -18,6 +19,14 @@ public interface MemTable {
 
     default RecordCursor scan(ByteKey fromKey, ByteKey toKey, long maxSequence) {
         return scan(fromKey, toKey);
+    }
+
+    default long deleteRange(ByteKey fromKey, ByteKey toKey, long sequence) {
+        return insert(fromKey, InternalRecord.rangeDelete(fromKey, toKey, sequence));
+    }
+
+    default List<InternalRecord.RangeDelete> rangeTombstones() {
+        return List.of();
     }
 
     long byteSize();

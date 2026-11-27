@@ -6,6 +6,7 @@ import io.jlsm.api.Snapshot;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
+import io.jlsm.internal.model.RangeTombstone;
 import io.jlsm.internal.model.RecordCursor;
 import io.jlsm.mem.MemTable;
 import io.jlsm.merge.DefaultMergedIterator;
@@ -97,10 +98,33 @@ public final class DefaultSnapshot implements Snapshot {
             cursors.add(immutableMemTable.scan(from, to, sequenceNumber));
         }
 
+        List<RangeTombstone> rangeTombstones = new ArrayList<>();
+        for (InternalRecord.RangeDelete rd : activeMemTable.rangeTombstones()) {
+            if (rd.sequence() <= sequenceNumber) {
+                rangeTombstones.add(rd.toRangeTombstone());
+            }
+        }
+        if (immutableMemTable != null) {
+            for (InternalRecord.RangeDelete rd : immutableMemTable.rangeTombstones()) {
+                if (rd.sequence() <= sequenceNumber) {
+                    rangeTombstones.add(rd.toRangeTombstone());
+                }
+            }
+        }
+        for (TableHandle handle : pinnedTables) {
+            if (handle.minSequence() <= sequenceNumber) {
+                for (RangeTombstone rt : handle.rangeTombstones()) {
+                    if (rt.sequenceNumber() <= sequenceNumber) {
+                        rangeTombstones.add(rt);
+                    }
+                }
+            }
+        }
+
         RecordCursor diskCursor = diskStorageReader.scanDisk(pinnedTables, from, to, sequenceNumber);
         cursors.add(diskCursor);
 
-        DefaultMergedIterator merged = new DefaultMergedIterator(cursors, false);
+        DefaultMergedIterator merged = new DefaultMergedIterator(cursors, false, rangeTombstones);
         return new SnapshotScanIterator(merged);
     }
 

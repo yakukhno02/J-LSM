@@ -79,6 +79,7 @@ flowchart TD
 | **Shared Model** | `io.jlsm.internal.model` | **Спільно** | Немає | `ByteKey`, `InternalRecord`, `RecordKind`, `KeyRange` |
 | **MemTable** | `io.jlsm.mem` | **Dev 1** | `internal.model` | Швидка сортована пам'ять, snapshot копії для scan |
 | **WriteBatch & Snapshots** | `io.jlsm.api`, `engine`, `mem` | **Dev 1** | `wal`, `mem`, `sst` | Атомарний пакетний запис (WriteBatch) та консистентні знімки (Snapshot, Scope Extension) |
+| **Range Deletes** | `io.jlsm.internal.model`, `mem`, `wal`, `sst`, `merge`, `engine` | **Спільно** | Усі модулі | Інтервальні томбстоуни `RangeTombstone`, бінарні кодеки WAL 0x04 та SSTable 0x02, затінення ключів (Scope Extension) |
 | **WAL Engine** | `io.jlsm.wal` | **Dev 1** | `internal.io`, `model` | Серіалізація кадрів, перевірка CRC32, tail recovery |
 | **Manifest Store** | `io.jlsm.manifest` | **Dev 1** | `internal.io` | Журнал стану (Catalog), атомарний commit add/remove |
 | **SSTable Codecs** | `io.jlsm.sst` | **Dev 2** | `internal.io`, `model` | Блоки 4 КБ, `SparseIndex`, `Footer`, `TableHandle`, `BloomFilter` (Scope Extension) |
@@ -106,6 +107,7 @@ public interface KVDatabase extends AutoCloseable {
     void put(byte[] key, byte[] value) throws StorageException;  
     byte[] get(byte[] key) throws StorageException;  
     void delete(byte[] key) throws StorageException;  
+    void deleteRange(byte[] fromKey, byte[] toKey) throws StorageException;  
 
     // Атомарне застосування пакета операцій (all-or-nothing)
     void write(WriteBatch batch) throws StorageException;
@@ -130,6 +132,7 @@ public interface WriteBatch extends AutoCloseable {
     }
     WriteBatch put(byte[] key, byte[] value);
     WriteBatch delete(byte[] key);
+    WriteBatch deleteRange(byte[] fromKey, byte[] toKey);
     int operationCount();
     long byteSize();
     void clear();
@@ -299,15 +302,39 @@ public final class ByteKey implements Comparable<ByteKey> {
 ```java
 package io.jlsm.internal.model;
 
-public enum RecordKind { PUT, DELETE }
+public enum RecordKind { PUT, DELETE, BATCH, RANGE_DELETE }
 
-public record InternalRecord(  
-        ByteKey key,  
-        byte[] value, // null для DELETE  
-        RecordKind kind,  
-        long sequence  
-) {  
-    public boolean isTombstone() { return kind == RecordKind.DELETE; }  
+public sealed interface InternalRecord permits InternalRecord.Put, InternalRecord.Delete, InternalRecord.RangeDelete {
+    ByteKey key();
+    byte[] value();
+    RecordKind kind();
+    long sequence();
+    boolean isTombstone();
+
+    record Put(ByteKey key, byte[] value, long sequence) implements InternalRecord {
+        @Override public RecordKind kind() { return RecordKind.PUT; }
+        @Override public boolean isTombstone() { return false; }
+    }
+
+    record Delete(ByteKey key, long sequence) implements InternalRecord {
+        @Override public byte[] value() { return null; }
+        @Override public RecordKind kind() { return RecordKind.DELETE; }
+        @Override public boolean isTombstone() { return true; }
+    }
+
+    record RangeDelete(ByteKey fromKey, ByteKey toKey, long sequence) implements InternalRecord {
+        @Override public ByteKey key() { return fromKey; }
+        @Override public byte[] value() { return toKey.bytes(); }
+        @Override public RecordKind kind() { return RecordKind.RANGE_DELETE; }
+        @Override public boolean isTombstone() { return true; }
+        public RangeTombstone toRangeTombstone() { return new RangeTombstone(fromKey, toKey, sequence); }
+    }
+}
+
+public record RangeTombstone(ByteKey fromKey, ByteKey toKey, long sequence) {
+    public boolean covers(ByteKey targetKey, long targetSequence) {
+        return targetSequence <= sequence && fromKey.compareTo(targetKey) <= 0 && toKey.compareTo(targetKey) > 0;
+    }
 }
 ```
 
@@ -827,7 +854,8 @@ gantt
 
 * **Віха M8 (Scope Extension — добір до ≥ 3 000 core LOC на людину):**
   * **Dev 1:** Атомарні пакети запису `WriteBatch` (інтерфейс, бінарний кадр WAL 0x03 BATCH, все-або-нічого відновлення, тест стійкості R-03 та property-тест P-06) та консистентні знімки `Consistent Read Snapshots` (інтерфейс `Snapshot`, ізоляція на рівні фіксованого sequence number, версіонування в `DefaultMemTable`, закріплення SSTables через ref-counting, property-тест P-08).
-  * **Dev 2:** Фільтри Блума для SSTable (`BloomFilter`, хешування, інтеграція в точковий пошук, тест P-07) та розширений `Compactor` з розбиттям вихідного потоку на таблиці фіксованого розміру (SSTable Splitting / Size-Tiered злиття з поверненням `List<TableMeta>`).
+  * **Dev 2:** Фільтри Блума для SSTable (`BloomFilter`, хешування, інтеграція в точковий пошук, тест P-07) та розширений `Compactor` з розбиттям вихідного потоку на таблиці фіксованого розміру (SSTable Splitting / Leveled Compaction Planner).
+  * **Спільно (Scope Extension #4):** Видалення діапазонів `Range Deletes / Range Tombstones` (інтерфейси `deleteRange` у `KVDatabase` та `WriteBatch`, бінарний кадр WAL 0x04, прапорець блоків SSTable 0x02, інтервальні томбстоуни `RangeTombstone` та затінення в `DefaultMergedIterator`, повна інтеграція зі Snapshot-ізоляцією, 8 наскрізних інтеграційних тестів `RangeDeleteTest`).
 * **Віха M9:** Фінальний прогін мутаційного тестування **Pitest (≥ 80%)**, лінійне покриття **≥ 90%**, аудит обсягу коду ядра (разом ≥ 6 000 LOC на команду) та захист проєкту.
 
 ## 8. Definition of Done (Критерії готовності)

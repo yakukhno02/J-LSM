@@ -5,7 +5,6 @@ import io.jlsm.api.StorageException;
 import io.jlsm.internal.io.ChannelIO;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
-import io.jlsm.internal.model.RecordKind;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -82,7 +81,6 @@ public final class DataBlockDecoder {
                     "Insufficient bytes for data block: " + buffer.remaining());
         }
 
-        int startPos = buffer.position();
         byte[] blockBytes = new byte[DataBlockEncoder.BLOCK_SIZE];
         buffer.get(blockBytes);
 
@@ -132,7 +130,8 @@ public final class DataBlockDecoder {
                         "Negative keyLen or valLen at record index " + i);
             }
 
-            if ((long) pos + keyLen + (flags == DataBlockEncoder.FLAG_PUT ? valLen : 0) > usedBytes) {
+            boolean hasValue = (flags == DataBlockEncoder.FLAG_PUT || flags == DataBlockEncoder.FLAG_RANGE_DELETE);
+            if ((long) pos + keyLen + (hasValue ? valLen : 0) > usedBytes) {
                 throw new StorageException(ErrorCode.CORRUPTION,
                         "Record payload exceeds usedBytes boundary at record index " + i);
             }
@@ -149,6 +148,11 @@ public final class DataBlockDecoder {
                 records.add(new InternalRecord.Put(ByteKey.copyOf(keyBytes), valBytes, sequence));
             } else if (flags == DataBlockEncoder.FLAG_DELETE) {
                 records.add(new InternalRecord.Delete(ByteKey.copyOf(keyBytes), sequence));
+            } else if (flags == DataBlockEncoder.FLAG_RANGE_DELETE) {
+                byte[] valBytes = new byte[valLen];
+                bb.get(valBytes);
+                pos += valLen;
+                records.add(new InternalRecord.RangeDelete(ByteKey.copyOf(keyBytes), ByteKey.copyOf(valBytes), sequence));
             } else {
                 throw new StorageException(ErrorCode.CORRUPTION,
                         String.format("Unknown record flags 0x%02X at record index %d", flags, i));
