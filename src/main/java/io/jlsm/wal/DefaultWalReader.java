@@ -29,6 +29,7 @@ public final class DefaultWalReader implements WalReader {
     private static final byte TYPE_PUT = DefaultWalWriter.TYPE_PUT;
     private static final byte TYPE_DELETE = DefaultWalWriter.TYPE_DELETE;
     private static final byte TYPE_BATCH = DefaultWalWriter.TYPE_BATCH;
+    private static final byte TYPE_RANGE_DELETE = DefaultWalWriter.TYPE_RANGE_DELETE;
 
     private final ChannelIO channel;
     private final Path path;
@@ -174,6 +175,36 @@ public final class DefaultWalReader implements WalReader {
         }
     }
 
+    private static ByteBuffer readAndVerifyPayload(
+            ChannelIO channel,
+            Path path,
+            long offset,
+            long remaining,
+            int payloadLen,
+            int storedCrc
+    ) throws IOException, StorageException {
+        int totalFrameLen = 4 + payloadLen;
+        if (remaining < totalFrameLen) {
+            return null;
+        }
+
+        ByteBuffer payloadBuf = ByteBuffer.allocate(payloadLen).order(ByteOrder.BIG_ENDIAN);
+        readFully(channel, payloadBuf, offset + 4);
+
+        CRC32 crc32 = new CRC32();
+        crc32.update(payloadBuf.array(), 0, payloadLen);
+        int calculatedCrc = (int) crc32.getValue();
+
+        if (storedCrc != calculatedCrc) {
+            throw new CorruptedLogException(path, offset,
+                    String.format("Frame CRC mismatch: stored 0x%08X, calculated 0x%08X", storedCrc, calculatedCrc));
+        }
+
+        payloadBuf.position(8 + 1 + 4 + 4);
+        return payloadBuf;
+    }
+
+
     private static ParsedFrame readAndValidateFrame(ChannelIO channel, Path path, long offset, long fileSize)
             throws IOException, StorageException {
         long remaining = fileSize - offset;
@@ -189,13 +220,15 @@ public final class DefaultWalReader implements WalReader {
         long seq = headerBuf.getLong();
         byte typeByte = headerBuf.get();
 
-        if (typeByte == TYPE_PUT || typeByte == TYPE_DELETE) {
+        if (typeByte == TYPE_PUT || typeByte == TYPE_DELETE || typeByte == TYPE_RANGE_DELETE) {
             int keyLen = headerBuf.getInt();
             int valLen = headerBuf.getInt();
 
             RecordKind kind;
             if (typeByte == TYPE_PUT) {
                 kind = RecordKind.PUT;
+            } else if (typeByte == TYPE_RANGE_DELETE) {
+                kind = RecordKind.RANGE_DELETE;
             } else {
                 kind = RecordKind.DELETE;
                 valLen = 0;
@@ -206,25 +239,11 @@ public final class DefaultWalReader implements WalReader {
             }
 
             int payloadLen = 8 + 1 + 4 + 4 + keyLen + valLen;
-            int totalFrameLen = 4 + payloadLen;
-
-            if (remaining < totalFrameLen) {
+            ByteBuffer payloadBuf = readAndVerifyPayload(channel, path, offset, remaining, payloadLen, storedCrc);
+            if (payloadBuf == null) {
                 return null;
             }
-
-            ByteBuffer payloadBuf = ByteBuffer.allocate(payloadLen).order(ByteOrder.BIG_ENDIAN);
-            readFully(channel, payloadBuf, offset + 4);
-
-            CRC32 crc32 = new CRC32();
-            crc32.update(payloadBuf.array(), 0, payloadLen);
-            int calculatedCrc = (int) crc32.getValue();
-
-            if (storedCrc != calculatedCrc) {
-                throw new CorruptedLogException(path, offset,
-                        String.format("Frame CRC mismatch: stored 0x%08X, calculated 0x%08X", storedCrc, calculatedCrc));
-            }
-
-            payloadBuf.position(8 + 1 + 4 + 4);
+            int totalFrameLen = 4 + payloadLen;
             byte[] key = new byte[keyLen];
             payloadBuf.get(key);
 
@@ -235,6 +254,12 @@ public final class DefaultWalReader implements WalReader {
                     payloadBuf.get(val);
                 }
                 record = new InternalRecord.Put(ByteKey.copyOf(key), val, seq);
+            } else if (kind == RecordKind.RANGE_DELETE) {
+                byte[] val = new byte[valLen];
+                if (valLen > 0) {
+                    payloadBuf.get(val);
+                }
+                record = new InternalRecord.RangeDelete(ByteKey.copyOf(key), ByteKey.copyOf(val), seq);
             } else {
                 record = new InternalRecord.Delete(ByteKey.copyOf(key), seq);
             }
@@ -249,25 +274,11 @@ public final class DefaultWalReader implements WalReader {
             }
 
             int payloadLen = 8 + 1 + 4 + 4 + batchPayloadLen;
-            int totalFrameLen = 4 + payloadLen;
-
-            if (remaining < totalFrameLen) {
+            ByteBuffer payloadBuf = readAndVerifyPayload(channel, path, offset, remaining, payloadLen, storedCrc);
+            if (payloadBuf == null) {
                 return null;
             }
-
-            ByteBuffer payloadBuf = ByteBuffer.allocate(payloadLen).order(ByteOrder.BIG_ENDIAN);
-            readFully(channel, payloadBuf, offset + 4);
-
-            CRC32 crc32 = new CRC32();
-            crc32.update(payloadBuf.array(), 0, payloadLen);
-            int calculatedCrc = (int) crc32.getValue();
-
-            if (storedCrc != calculatedCrc) {
-                throw new CorruptedLogException(path, offset,
-                        String.format("Frame CRC mismatch: stored 0x%08X, calculated 0x%08X", storedCrc, calculatedCrc));
-            }
-
-            payloadBuf.position(8 + 1 + 4 + 4);
+            int totalFrameLen = 4 + payloadLen;
             List<InternalRecord> records = new ArrayList<>(opCount);
 
             for (int i = 0; i < opCount; i++) {
@@ -282,7 +293,7 @@ public final class DefaultWalReader implements WalReader {
                     throw new CorruptedLogException(path, offset + 21L, "Invalid batch keyLen or valLen at op " + i);
                 }
 
-                if (opType != TYPE_PUT && opType != TYPE_DELETE) {
+                if (opType != TYPE_PUT && opType != TYPE_DELETE && opType != TYPE_RANGE_DELETE) {
                     throw new CorruptedLogException(path, offset + 21L, "Unknown batch opType: " + opType + " at op " + i);
                 }
                 if (opType == TYPE_DELETE) {
@@ -303,6 +314,12 @@ public final class DefaultWalReader implements WalReader {
                         payloadBuf.get(opVal);
                     }
                     records.add(new InternalRecord.Put(ByteKey.copyOf(opKey), opVal, recordSeq));
+                } else if (opType == TYPE_RANGE_DELETE) {
+                    byte[] opVal = new byte[opValLen];
+                    if (opValLen > 0) {
+                        payloadBuf.get(opVal);
+                    }
+                    records.add(new InternalRecord.RangeDelete(ByteKey.copyOf(opKey), ByteKey.copyOf(opVal), recordSeq));
                 } else {
                     records.add(new InternalRecord.Delete(ByteKey.copyOf(opKey), recordSeq));
                 }

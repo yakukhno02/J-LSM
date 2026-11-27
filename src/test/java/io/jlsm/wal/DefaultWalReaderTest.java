@@ -503,4 +503,46 @@ class DefaultWalReaderTest {
                     .hasMessageContaining("Frame CRC mismatch");
         }
     }
+    @Test
+    @DisplayName("openCursor decodes standalone and batch range delete frames")
+    void testReadRangeDeleteFrames() throws Exception {
+        InMemoryChannelIO writeChannel = new InMemoryChannelIO();
+        try (DefaultWalWriter writer = DefaultWalWriter.create(writeChannel, 1L, DurabilityMode.BUFFERED)) {
+            writer.appendRangeDelete(10L, bytes("keyA"), bytes("keyM"));
+            writer.appendBatch(11L, List.of(
+                    BatchOperation.put(bytes("k1"), bytes("v1")),
+                    BatchOperation.deleteRange(bytes("r1"), bytes("r9")),
+                    BatchOperation.delete(bytes("k2"))
+            ));
+        }
+
+        InMemoryChannelIO readChannel = new InMemoryChannelIO(writeChannel.toByteArray());
+        try (DefaultWalReader reader = DefaultWalReader.open(readChannel, TEST_PATH);
+             RecordCursor cursor = reader.openCursor()) {
+            assertThat(cursor.advance()).isTrue();
+            InternalRecord r1 = cursor.current();
+            assertThat(r1).isInstanceOf(InternalRecord.RangeDelete.class);
+            InternalRecord.RangeDelete rd1 = (InternalRecord.RangeDelete) r1;
+            assertThat(rd1.sequence()).isEqualTo(10L);
+            assertThat(rd1.fromKey()).isEqualTo(ByteKey.copyOf(bytes("keyA")));
+            assertThat(rd1.toKey()).isEqualTo(ByteKey.copyOf(bytes("keyM")));
+
+            assertThat(cursor.advance()).isTrue();
+            assertThat(cursor.current()).isInstanceOf(InternalRecord.Put.class);
+            assertThat(cursor.current().sequence()).isEqualTo(11L);
+
+            assertThat(cursor.advance()).isTrue();
+            assertThat(cursor.current()).isInstanceOf(InternalRecord.RangeDelete.class);
+            InternalRecord.RangeDelete rd2 = (InternalRecord.RangeDelete) cursor.current();
+            assertThat(rd2.sequence()).isEqualTo(12L);
+            assertThat(rd2.fromKey()).isEqualTo(ByteKey.copyOf(bytes("r1")));
+            assertThat(rd2.toKey()).isEqualTo(ByteKey.copyOf(bytes("r9")));
+
+            assertThat(cursor.advance()).isTrue();
+            assertThat(cursor.current()).isInstanceOf(InternalRecord.Delete.class);
+            assertThat(cursor.current().sequence()).isEqualTo(13L);
+
+            assertThat(cursor.advance()).isFalse();
+        }
+    }
 }

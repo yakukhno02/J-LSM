@@ -24,6 +24,7 @@ public final class DefaultWalWriter implements WalWriter {
     public static final byte TYPE_PUT = 0x01;
     public static final byte TYPE_DELETE = 0x02;
     public static final byte TYPE_BATCH = 0x03;
+    public static final byte TYPE_RANGE_DELETE = 0x04;
 
     private final ChannelIO channel;
     private final DurabilityMode durabilityMode;
@@ -84,63 +85,28 @@ public final class DefaultWalWriter implements WalWriter {
 
         int keyLen = key.length;
         int valLen = 0;
-        byte type;
+        byte type = toFrameType(kind);
 
         if (kind == RecordKind.PUT) {
             Objects.requireNonNull(value, "value cannot be null for PUT");
             valLen = value.length;
-            type = TYPE_PUT;
+        } else if (kind == RecordKind.RANGE_DELETE) {
+            Objects.requireNonNull(value, "value (toKey) cannot be null for RANGE_DELETE");
+            valLen = value.length;
         } else {
-            type = TYPE_DELETE;
             value = null;
         }
 
-        if ((long) keyLen + valLen > MAX_KEY_VALUE_TOTAL_BYTES) {
-            throw new IllegalArgumentException("Combined key and value length (" + (keyLen + valLen)
-                    + ") exceeds maximum allowed limit of " + MAX_KEY_VALUE_TOTAL_BYTES + " bytes");
-        }
+        validateCombinedLength(keyLen, valLen);
 
         int payloadLen = 8 + 1 + 4 + 4 + keyLen + valLen;
-        int totalFrameLen = 4 + payloadLen;
-
-        ByteBuffer frameBuf = ByteBuffer.allocate(totalFrameLen).order(ByteOrder.BIG_ENDIAN);
-        frameBuf.position(4);
-
-        frameBuf.putLong(sequence);
-        frameBuf.put(type);
-        frameBuf.putInt(keyLen);
-        frameBuf.putInt(valLen);
+        ByteBuffer frameBuf = createFrameBuffer(payloadLen, sequence, type, keyLen, valLen);
         frameBuf.put(key);
         if (value != null && valLen > 0) {
             frameBuf.put(value);
         }
 
-        CRC32 crc32 = new CRC32();
-        crc32.update(frameBuf.array(), 4, payloadLen);
-        int computedCrc = (int) crc32.getValue();
-
-        frameBuf.putInt(0, computedCrc);
-        frameBuf.position(0);
-
-        long offsetWritten = writeOffset;
-        try {
-            writeFully(channel, frameBuf, offsetWritten);
-            writeOffset += totalFrameLen;
-
-            if (durabilityMode == DurabilityMode.SYNC) {
-                channel.force(false);
-            }
-        } catch (IOException e) {
-            try {
-                channel.truncate(offsetWritten);
-            } catch (IOException truncateEx) {
-                e.addSuppressed(truncateEx);
-            }
-            writeOffset = offsetWritten;
-            throw new StorageException(ErrorCode.IO, "Failed to append record at sequence: " + sequence, e);
-        }
-
-        return offsetWritten;
+        return writeFrame(frameBuf, payloadLen, sequence, false);
     }
 
     @Override
@@ -156,49 +122,75 @@ public final class DefaultWalWriter implements WalWriter {
         for (BatchOperation op : operations) {
             Objects.requireNonNull(op, "batch operation cannot be null");
             int keyLen = op.rawKey().length;
-            int valLen = (op.kind() == RecordKind.PUT && op.rawValue() != null) ? op.rawValue().length : 0;
-            if ((long) keyLen + valLen > MAX_KEY_VALUE_TOTAL_BYTES) {
-                throw new IllegalArgumentException("Combined key and value length (" + (keyLen + valLen)
-                        + ") exceeds maximum allowed limit of " + MAX_KEY_VALUE_TOTAL_BYTES + " bytes");
-            }
+            int valLen = (hasPayloadValue(op.kind()) && op.rawValue() != null) ? op.rawValue().length : 0;
+            validateCombinedLength(keyLen, valLen);
             batchPayloadLen += (1 + 4 + 4 + keyLen + valLen);
         }
 
         int payloadLenAfterCrc = 8 + 1 + 4 + 4 + batchPayloadLen;
-        int totalFrameLen = 4 + payloadLenAfterCrc;
-
-        ByteBuffer frameBuf = ByteBuffer.allocate(totalFrameLen).order(ByteOrder.BIG_ENDIAN);
-        frameBuf.position(4);
-
-        frameBuf.putLong(startSequence);
-        frameBuf.put(TYPE_BATCH);
-        frameBuf.putInt(opCount);
-        frameBuf.putInt(batchPayloadLen);
+        ByteBuffer frameBuf = createFrameBuffer(payloadLenAfterCrc, startSequence, TYPE_BATCH, opCount, batchPayloadLen);
 
         for (BatchOperation op : operations) {
-            byte type = op.kind() == RecordKind.PUT ? TYPE_PUT : TYPE_DELETE;
+            byte type = toFrameType(op.kind());
             byte[] key = op.rawKey();
             byte[] val = op.rawValue();
             int keyLen = key.length;
-            int valLen = (op.kind() == RecordKind.PUT && val != null) ? val.length : 0;
+            int valLen = (hasPayloadValue(op.kind()) && val != null) ? val.length : 0;
 
             frameBuf.put(type);
             frameBuf.putInt(keyLen);
             frameBuf.putInt(valLen);
             frameBuf.put(key);
-            if (op.kind() == RecordKind.PUT && valLen > 0) {
+            if (valLen > 0) {
                 frameBuf.put(val);
             }
         }
 
+        return writeFrame(frameBuf, payloadLenAfterCrc, startSequence, true);
+    }
+
+    private static void validateCombinedLength(int keyLen, int valLen) {
+        if ((long) keyLen + valLen > MAX_KEY_VALUE_TOTAL_BYTES) {
+            throw new IllegalArgumentException("Combined key and value length (" + (keyLen + valLen)
+                    + ") exceeds maximum allowed limit of " + MAX_KEY_VALUE_TOTAL_BYTES + " bytes");
+        }
+    }
+
+    private static ByteBuffer createFrameBuffer(int payloadLen, long sequence, byte type, int int1, int int2) {
+        int totalFrameLen = 4 + payloadLen;
+        ByteBuffer frameBuf = ByteBuffer.allocate(totalFrameLen).order(ByteOrder.BIG_ENDIAN);
+        frameBuf.position(4);
+        frameBuf.putLong(sequence);
+        frameBuf.put(type);
+        frameBuf.putInt(int1);
+        frameBuf.putInt(int2);
+        return frameBuf;
+    }
+
+    private static boolean hasPayloadValue(RecordKind kind) {
+        return kind == RecordKind.PUT || kind == RecordKind.RANGE_DELETE;
+    }
+
+    private static byte toFrameType(RecordKind kind) {
+        return switch (kind) {
+            case PUT -> TYPE_PUT;
+            case RANGE_DELETE -> TYPE_RANGE_DELETE;
+            case DELETE -> TYPE_DELETE;
+            default -> throw new IllegalArgumentException("Unsupported record kind for WAL: " + kind);
+        };
+    }
+
+    private long writeFrame(ByteBuffer frameBuf, int payloadLen, long sequence, boolean isBatch)
+            throws StorageException {
         CRC32 crc32 = new CRC32();
-        crc32.update(frameBuf.array(), 4, payloadLenAfterCrc);
+        crc32.update(frameBuf.array(), 4, payloadLen);
         int computedCrc = (int) crc32.getValue();
 
         frameBuf.putInt(0, computedCrc);
         frameBuf.position(0);
 
         long offsetWritten = writeOffset;
+        int totalFrameLen = frameBuf.capacity();
         try {
             writeFully(channel, frameBuf, offsetWritten);
             writeOffset += totalFrameLen;
@@ -213,7 +205,10 @@ public final class DefaultWalWriter implements WalWriter {
                 e.addSuppressed(truncateEx);
             }
             writeOffset = offsetWritten;
-            throw new StorageException(ErrorCode.IO, "Failed to append batch at sequence: " + startSequence, e);
+            String msg = isBatch
+                    ? "Failed to append batch at sequence: " + sequence
+                    : "Failed to append record at sequence: " + sequence;
+            throw new StorageException(ErrorCode.IO, msg, e);
         }
 
         return offsetWritten;
