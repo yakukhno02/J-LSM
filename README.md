@@ -22,11 +22,11 @@
 
 ## 🚀 Основні можливості
 
-- **Append-only WAL** із захистом цілісності через CRC32 та відновленням після обривів запису (torn-write recovery).
-- **Дворівневий MemTable:** активна таблиця для запису та незмінна (immutable) для фонового скидання (flush).
-- **Формат SSTable:** вирівняні 4 КБ Data Blocks, бінарний Sparse Index та перевірка Magic Number у Footer.
-- **Фоновий Compactor:** K-Way злиття із дедуплікацією за Sequence Number та безпечною утилізацією Tombstones.
-- **Підтримка API:** `put`, `get`, `delete`, `scan` (діапазонне читання) та `sync`.
+- **Append-only WAL** із захистом цілісності через CRC32, підтримкою атомарних пакетів (`0x03 BATCH`) та діапазонних видалень (`0x04 RANGE_DELETE`), а також автоматичним відновленням після обривів запису (torn-write recovery).
+- **Дворівневий MVCC MemTable:** активна таблиця для запису та незмінна (immutable) для фонового скидання (flush) із підтримкою багатоверсійної історії та інтервальних томбстоунів (`RangeTombstone`).
+- **Формат SSTable:** вирівняні 4 КБ Data Blocks, вбудований бітовий **Bloom Filter** (`JBLM`, $m/n = 10$, $k = 7$, Murmur3 64-bit double hashing), бінарний Sparse Index та перевірка Magic Number у Footer.
+- **Розширений Compactor (SSTable Splitting, STCS & Leveled Planner):** потокове K-Way злиття з розбиттям вихідного потоку на таблиці фіксованого розміру (`buildSplit`), стратегіями планування `SizeTieredCompactionPlanner` та `LeveledCompactionPlanner`, дедуплікацією за Sequence Number та безпечною утилізацією точкових і діапазонних Tombstones.
+- **Підтримка API:** `put`, `get`, `delete`, `deleteRange`, `write(WriteBatch)`, `snapshot()` (`Snapshot` point-in-time MVCC ізоляція), `scan` (діапазонне читання) та `sync`.
 - **Захист пам'яті:** динамічний backpressure під обмеженням купи (перевірено під `-Xmx32m` для потоку 500 МБ).
 - **Стійкість до збоїв:** гарантоване відновлення стану після раптового завершення процесу (`kill -9`).
 
@@ -69,13 +69,16 @@ java -jar target/j-lsm-1.0.0-SNAPSHOT.jar --dir ./jlsm-demo dump-sst
 
 ### Основні команди інтерактивної консолі (`j-lsm>`):
 - `put <key> <value>` — запис або оновлення пари ключ-значення
-- `get <key>` — точковий пошук ключа (`Active MemTable -> Immutable MemTable -> SparseIndex 4KB SSTables`)
+- `get <key>` — точковий пошук ключа (`Active MemTable -> Immutable MemTable -> BloomFilter -> SparseIndex 4KB SSTables`)
 - `delete <key>` (`del <key>`) — логічне видалення через запис `Tombstone`
+- `delete-range <fromKey> <toKey>` (`del-range`) — інтервальне видалення діапазону `[fromKey, toKey)` через `RangeTombstone` (кадр WAL `0x04`)
+- `batch <put:k=v | del:k | delrange:from..to> ...` — атомарний пакетний запис `WriteBatch` (кадр WAL `0x03`, принцип All-or-Nothing)
+- `snap [fromKey|*] [toKey|*]` (`snapshot-scan`) — ізольоване point-in-time сканування діапазону через `Snapshot`
 - `scan [fromKey|*] [toKey|*]` — діапазонне читання `[fromKey, toKey)` через `K-Way Merge`
 - `metrics` (`stats`) — телеметрія в реальному часі (операції, заповнення RAM, кількість SSTable, лічильники Flush і Compaction)
 - `inspect` (`diag`) — перевірка цілісності каталогу `MANIFEST`, `.wal` та `.sst` файлів
-- `dump-sst <file.sst>` — дамп бінарної структури SSTable-файлу
+- `dump-sst <file.sst>` — дамп бінарної структури SSTable-файлу (Header, 4KB Data Blocks, Bloom Filter EstFPP, Sparse Index, Footer)
 - `backup <dir>` / `verify-backup <dir>` / `restore <backupDir> <targetDir>` — гаряче резервне копіювання та відновлення з перевіркою CRC32
 - `benchmark [count] [valueBytes]` — запуск навантажувального тесту швидкодії
-- `demo` — повний сценарій демонстрації для захисту проєкту
+- `demo` — повний сценарій демонстрації (CRUD, Flush, Compaction, WriteBatch, RangeDelete, Snapshot, Torn-WAL Recovery)
 - `help` / `exit` — довідка та безпечне закриття бази
