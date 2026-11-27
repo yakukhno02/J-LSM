@@ -3,6 +3,7 @@ package io.jlsm.sst;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.model.ByteKey;
 import io.jlsm.internal.model.InternalRecord;
+import io.jlsm.internal.model.RangeTombstone;
 import io.jlsm.internal.model.RecordCursor;
 import io.jlsm.merge.DefaultMergedIterator;
 
@@ -13,7 +14,7 @@ import java.util.Optional;
 
 /**
  * Standard implementation of {@link DiskStorageReader} providing point lookup across
- * active SSTables with sequence-based conflict resolution and range scanning via K-way merge.
+ * active SSTables with sequence-based conflict resolution, range tombstones, and range scanning via K-way merge.
  */
 public final class DefaultDiskStorageReader implements DiskStorageReader {
 
@@ -28,6 +29,20 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
         Objects.requireNonNull(key, "key cannot be null");
 
         InternalRecord best = null;
+
+        // Check range tombstones in pinned tables
+        for (TableHandle handle : pinnedTables) {
+            if (handle.minSequence() > maxSequence) {
+                continue;
+            }
+            for (RangeTombstone rt : handle.rangeTombstones()) {
+                if (rt.covers(key, Long.MIN_VALUE) && rt.sequenceNumber() <= maxSequence) {
+                    if (best == null || rt.sequenceNumber() > best.sequence()) {
+                        best = new InternalRecord.RangeDelete(rt.fromKey(), rt.toKey(), rt.sequenceNumber());
+                    }
+                }
+            }
+        }
 
         for (TableHandle handle : pinnedTables) {
             // Prune search if SSTable was written strictly after maxSequence
@@ -72,16 +87,22 @@ public final class DefaultDiskStorageReader implements DiskStorageReader {
         }
 
         List<RecordCursor> cursors = new ArrayList<>(pinnedTables.size());
+        List<RangeTombstone> rangeTombstones = new ArrayList<>();
         for (TableHandle handle : pinnedTables) {
             if (handle.minSequence() > maxSequence) {
                 continue;
+            }
+            for (RangeTombstone rt : handle.rangeTombstones()) {
+                if (rt.sequenceNumber() <= maxSequence) {
+                    rangeTombstones.add(rt);
+                }
             }
             RecordCursor rawCursor = handle.scan(fromKey, toKey);
             cursors.add(new SequenceFilterRecordCursor(rawCursor, maxSequence));
         }
 
         // In disk scan, tombstones are filtered out (retainTombstones = false)
-        return new DefaultMergedIterator(cursors, false);
+        return new DefaultMergedIterator(cursors, false, rangeTombstones);
     }
 
     private static final class SequenceFilterRecordCursor implements RecordCursor {

@@ -3,6 +3,7 @@ package io.jlsm.merge;
 import io.jlsm.api.ErrorCode;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.model.InternalRecord;
+import io.jlsm.internal.model.RangeTombstone;
 import io.jlsm.internal.model.RecordCursor;
 
 import java.util.ArrayList;
@@ -17,21 +18,28 @@ import java.util.PriorityQueue;
  * 1. Primary order: ascending by unsigned key byte order.
  * 2. Secondary order: descending by sequence number (latest version wins).
  * 3. Deduplication: multiple versions of the same key are collapsed to the highest sequence.
- * 4. Tombstone handling: tombstones can be filtered out (for scans) or retained (for compaction).
+ * 4. Tombstone handling: point and range tombstones can be filtered out (for scans) or retained (for compaction).
  */
 public final class DefaultMergedIterator implements MergedIterator {
 
     private final List<RecordCursor> inputs;
     private final PriorityQueue<CursorHead> heap;
     private final boolean retainTombstones;
+    private final List<RangeTombstone> rangeTombstones;
     private InternalRecord currentRecord;
     private boolean closed;
 
     public DefaultMergedIterator(List<RecordCursor> inputs, boolean retainTombstones) throws StorageException {
+        this(inputs, retainTombstones, List.of());
+    }
+
+    public DefaultMergedIterator(List<RecordCursor> inputs, boolean retainTombstones, List<RangeTombstone> rangeTombstones) throws StorageException {
         Objects.requireNonNull(inputs, "inputs cannot be null");
+        Objects.requireNonNull(rangeTombstones, "rangeTombstones cannot be null");
         this.inputs = new ArrayList<>(inputs);
         this.heap = new PriorityQueue<>();
         this.retainTombstones = retainTombstones;
+        this.rangeTombstones = new ArrayList<>(rangeTombstones);
 
         for (int i = 0; i < this.inputs.size(); i++) {
             RecordCursor cursor = this.inputs.get(i);
@@ -47,6 +55,9 @@ public final class DefaultMergedIterator implements MergedIterator {
 
         while (!heap.isEmpty()) {
             CursorHead winnerHead = heap.poll();
+            if (winnerHead == null) {
+                break;
+            }
             InternalRecord winner = winnerHead.current();
 
             // Advance the winning cursor
@@ -55,7 +66,27 @@ public final class DefaultMergedIterator implements MergedIterator {
             // Deduplicate: advance all other cursors pointing to the exact same key
             while (!heap.isEmpty() && heap.peek().current().key().equals(winner.key())) {
                 CursorHead duplicateHead = heap.poll();
-                advanceCursorAndReinsert(duplicateHead);
+                if (duplicateHead != null) {
+                    advanceCursorAndReinsert(duplicateHead);
+                }
+            }
+
+            // Dynamically register range tombstones encountered in the stream
+            if (winner instanceof InternalRecord.RangeDelete rd) {
+                rangeTombstones.add(rd.toRangeTombstone());
+            }
+
+            // Check if point record is shadowed by any known range tombstone
+            boolean shadowedByRangeTombstone = false;
+            for (RangeTombstone rt : rangeTombstones) {
+                if (rt.covers(winner.key(), winner.sequence())) {
+                    shadowedByRangeTombstone = true;
+                    break;
+                }
+            }
+
+            if (shadowedByRangeTombstone) {
+                continue;
             }
 
             // If tombstone filtering is active, skip tombstones
@@ -118,7 +149,7 @@ public final class DefaultMergedIterator implements MergedIterator {
     }
 
     private void advanceCursorAndReinsert(CursorHead head) throws StorageException {
-        if (head.cursor.advance()) {
+        if (head.advance()) {
             heap.add(head);
         }
     }
@@ -129,13 +160,9 @@ public final class DefaultMergedIterator implements MergedIterator {
         }
     }
 
-    private static final class CursorHead implements Comparable<CursorHead> {
-        private final RecordCursor cursor;
-        private final int index;
-
-        CursorHead(RecordCursor cursor, int index) {
-            this.cursor = cursor;
-            this.index = index;
+    private record CursorHead(RecordCursor cursor, int index) implements Comparable<CursorHead> {
+        boolean advance() throws StorageException {
+            return cursor.advance();
         }
 
         InternalRecord current() {

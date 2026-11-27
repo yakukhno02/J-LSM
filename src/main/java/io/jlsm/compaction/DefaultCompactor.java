@@ -4,6 +4,7 @@ import io.jlsm.api.ErrorCode;
 import io.jlsm.api.StorageException;
 import io.jlsm.internal.io.StorageIO;
 import io.jlsm.internal.model.InternalRecord;
+import io.jlsm.internal.model.RangeTombstone;
 import io.jlsm.internal.model.RecordCursor;
 import io.jlsm.manifest.TableMeta;
 import io.jlsm.merge.DefaultMergedIterator;
@@ -79,7 +80,11 @@ public final class DefaultCompactor implements Compactor {
         }
 
         List<RecordCursor> cursors = openCursors(pinnedInputs);
-        try (DefaultMergedIterator merged = new DefaultMergedIterator(cursors, retainTombstones)) {
+        List<RangeTombstone> rangeTombstones = new ArrayList<>();
+        for (TableHandle handle : pinnedInputs) {
+            rangeTombstones.addAll(handle.rangeTombstones());
+        }
+        try (DefaultMergedIterator merged = new DefaultMergedIterator(cursors, retainTombstones, rangeTombstones)) {
             if (!merged.advance()) {
                 // All input tables are empty or all records were annihilated by tombstones
                 return Optional.empty();
@@ -123,8 +128,12 @@ public final class DefaultCompactor implements Compactor {
 
         List<RecordCursor> cursors = openCursors(pinnedInputs);
         List<TableMeta> producedTables = new ArrayList<>();
+        List<RangeTombstone> rangeTombstones = new ArrayList<>();
+        for (TableHandle handle : pinnedInputs) {
+            rangeTombstones.addAll(handle.rangeTombstones());
+        }
 
-        try (DefaultMergedIterator merged = new DefaultMergedIterator(cursors, retainTombstones)) {
+        try (DefaultMergedIterator merged = new DefaultMergedIterator(cursors, retainTombstones, rangeTombstones)) {
             if (!merged.advance()) {
                 return List.of();
             }
